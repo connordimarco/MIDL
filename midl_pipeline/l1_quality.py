@@ -1,17 +1,19 @@
 """
 l1_quality.py
 -------------
-Plasma quality assessment for all three L1 satellites (ACE, DSCOVR, WIND).
+Plasma quality assessment for all L1 satellites.
 
 Produces per-satellite, per-variable, per-timestep boolean bad-masks.
 Three checks are applied per satellite:
 
   1. Flat-plateau detection   — stuck/near-constant instrument readings
-  2. Outlier detection        — flags odd-one-out when 2-of-3 satellites agree
+  2. Outlier detection        — flags odd-one-out when others agree
   3. Near-zero clearing       — Uy/Uz pinned near zero (DSCOVR only)
 
 Main entry point: ``score_all_plasma()``.
 """
+
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
@@ -80,44 +82,56 @@ _OUTLIER_PARAMS = {
 }
 
 
-def check_outlier_satellite(df_ace, df_dsc, df_wind, variables=None):
-    """Flag the outlier when 2 of 3 satellites agree and 1 disagrees.
+def check_outlier_satellite(sat_dfs, variables=None):
+    """Flag outlier satellites when other pairs agree and this one disagrees.
 
-    A satellite is flagged only when the other two *agree* with each other
-    (pairwise deviation within threshold) **and** it disagrees with both.
-    This avoids cross-contamination that occurs when using a combined
-    reference from two satellites that may include a bad one.
+    A satellite is flagged only when at least one pair of the remaining
+    satellites agrees (pairwise deviation within threshold) **and** it
+    disagrees with both members of that pair.  Requires >= 3 satellites
+    with non-NaN data for the variable; returns empty masks otherwise.
+
+    Parameters
+    ----------
+    sat_dfs : dict[str, pd.DataFrame]
+        Per-satellite DataFrames keyed by satellite name.
 
     Returns
     -------
-    result : dict[int, dict[str, pd.Series]]
-        ``result[sat_code][var]`` is True where that satellite is an outlier.
+    result : dict[str, dict[str, pd.Series]]
+        ``result[sat_name][var]`` is True where that satellite is an outlier.
     """
     if variables is None:
         variables = list(_OUTLIER_PARAMS.keys())
 
-    idx = df_ace.index
-    sat_series_all = {1: df_ace, 2: df_dsc, 3: df_wind}
-    codes = [1, 2, 3]
-    result = {c: {} for c in codes}
+    names = sorted(sat_dfs.keys())
+    idx = next(iter(sat_dfs.values())).index
+    result = {name: {} for name in names}
 
     for var in variables:
         p = _OUTLIER_PARAMS[var]
         w = p['window']
 
         s = {}
-        for c, df in sat_series_all.items():
-            s[c] = df[var].reindex(
+        for name in names:
+            df = sat_dfs[name]
+            s[name] = df[var].reindex(
                 idx) if var in df.columns else pd.Series(np.nan, index=idx)
 
-        # Pairwise agreement masks for every combination.
+        has_data = [name for name in names if not s[name].isna().all()]
+
+        if len(has_data) < 3:
+            for name in names:
+                result[name][var] = pd.Series(False, index=idx)
+            continue
+
         pair_ok = {}
-        for a, b in [(1, 2), (1, 3), (2, 3)]:
+        for a, b in combinations(has_data, 2):
+            key = (a, b)
             if p['mode'] == 'abs':
                 dev = (s[a] - s[b]).abs()
                 roll = dev.rolling(window=w, center=True,
                                    min_periods=5).median()
-                pair_ok[(a, b)] = (roll <= p['threshold']).fillna(True)
+                pair_ok[key] = (roll <= p['threshold']).fillna(True)
             else:
                 with np.errstate(divide='ignore', invalid='ignore'):
                     ratio = s[a] / s[b]
@@ -125,16 +139,24 @@ def check_outlier_satellite(df_ace, df_dsc, df_wind, variables=None):
                 log_thresh = np.log(p['threshold'])
                 roll = log_r.rolling(window=w, center=True,
                                      min_periods=5).median()
-                pair_ok[(a, b)] = (roll <= log_thresh).fillna(True)
+                pair_ok[key] = (roll <= log_thresh).fillna(True)
 
-        for c in codes:
-            others = sorted(x for x in codes if x != c)
-            a, b = others
-            others_agree = pair_ok[(min(a, b), max(a, b))]
-            disagrees_a = ~pair_ok[(min(c, a), max(c, a))]
-            disagrees_b = ~pair_ok[(min(c, b), max(c, b))]
-            result[c][var] = (others_agree & disagrees_a &
-                              disagrees_b).fillna(False)
+        for name in names:
+            if name not in has_data:
+                result[name][var] = pd.Series(False, index=idx)
+                continue
+
+            others = [n for n in has_data if n != name]
+            flagged = pd.Series(False, index=idx)
+            for a, b in combinations(others, 2):
+                others_agree = pair_ok[(a, b)]
+                key_a = (min(name, a), max(name, a))
+                key_b = (min(name, b), max(name, b))
+                disagrees_a = ~pair_ok[key_a]
+                disagrees_b = ~pair_ok[key_b]
+                flagged = flagged | (others_agree & disagrees_a & disagrees_b)
+
+            result[name][var] = flagged.fillna(False)
 
     return result
 
@@ -194,55 +216,53 @@ def check_near_zero(df_dsc, variables=None, atol=0.5):
 PLASMA_VARS = ['Ux', 'Uy', 'Uz', 'rho']
 
 
-def score_all_plasma(df_ace, df_dsc, df_wind):
+def score_all_plasma(sat_dfs):
     """Evaluate plasma quality for every satellite, variable, and minute.
 
-    Flags the odd-one-out when the other two satellites agree
-    (outlier detection), plus per-satellite NaN-fraction,
-    flat-plateau, and near-zero checks.
+    Parameters
+    ----------
+    sat_dfs : dict[str, pd.DataFrame]
+        Per-satellite DataFrames keyed by satellite name.
 
     Returns
     -------
-    all_bad : dict[int, dict[str, pd.Series]]
-        ``all_bad[sat_code][var]`` is True where that satellite’s value
-        should not be used.  Codes: 1 = ACE, 2 = DSCOVR, 3 = WIND.
+    all_bad : dict[str, dict[str, pd.Series]]
+        ``all_bad[sat_name][var]`` is True where that satellite's value
+        should not be used.
     """
-    idx = df_ace.index
-    df_ace = df_ace.reindex(
-        idx) if not df_ace.empty else pd.DataFrame(index=idx)
-    df_dsc = df_dsc.reindex(
-        idx) if not df_dsc.empty else pd.DataFrame(index=idx)
-    df_wind = df_wind.reindex(
-        idx) if not df_wind.empty else pd.DataFrame(index=idx)
+    idx = None
+    for df in sat_dfs.values():
+        if not df.empty:
+            idx = df.index
+            break
+    if idx is None:
+        return {name: {} for name in sat_dfs}
 
-    sat_dfs = {1: df_ace, 2: df_dsc, 3: df_wind}
-    sat_names = {1: 'ACE', 2: 'DSCOVR', 3: 'WIND'}
+    aligned = {}
+    for name, df in sat_dfs.items():
+        aligned[name] = df.reindex(idx) if not df.empty else pd.DataFrame(
+            index=idx)
 
-    # --- Outlier detection (works when 3 satellites are present) ---
-    outlier_masks = check_outlier_satellite(
-        df_ace, df_dsc, df_wind, PLASMA_VARS)
+    outlier_masks = check_outlier_satellite(aligned, PLASMA_VARS)
 
     all_bad = {}
-    for code, df_target in sat_dfs.items():
-        # Flat-plateau applies to all satellites (any instrument can get stuck).
-        # Near-zero Uy/Uz is DSCOVR-specific: it catches a Faraday cup artefact
-        # where DSCOVR zeroes transverse velocity; ACE/WIND can legitimately have
-        # near-zero Uy/Uz during quiet solar wind conditions.
+    for name, df_target in aligned.items():
         plateau_m = check_flat_plateau(df_target, PLASMA_VARS)
-        zero_m = check_near_zero(df_target, ['Uy', 'Uz']) if code == 2 else {}
+        zero_m = (check_near_zero(df_target, ['Uy', 'Uz'])
+                  if name == 'dscovr' else {})
 
         bad = {}
         for var in PLASMA_VARS:
             composite = pd.Series(False, index=idx)
-            if var in outlier_masks.get(code, {}):
-                composite = composite | outlier_masks[code][var]
+            if var in outlier_masks.get(name, {}):
+                composite = composite | outlier_masks[name][var]
             for masks in [plateau_m, zero_m]:
                 if var in masks:
                     composite = composite | masks[var]
             bad[var] = composite
 
         n_flagged = {v: int(m.sum()) for v, m in bad.items()}
-        print(f'  {sat_names[code]} quality: flagged bad: {n_flagged}')
-        all_bad[code] = bad
+        print(f'  {name.upper()} quality: flagged bad: {n_flagged}')
+        all_bad[name] = bad
 
     return all_bad

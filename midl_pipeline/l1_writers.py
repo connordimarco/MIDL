@@ -66,7 +66,8 @@ def write_monthly_outputs(result, output_dir='data'):
 def _frozenset_to_str(fs):
     """Convert frozenset of satellite codes to a sorted digit string.
 
-    1=ACE, 2=DSCOVR, 3=WIND.  e.g. frozenset({1,3}) -> '13'.
+    1=ACE, 2=DSCOVR, 3=WIND, 4=SOLAR-1, 5=IMAP (reserved).
+    e.g. frozenset({1,3}) -> '13'.
     """
     if fs is None or (isinstance(fs, frozenset) and not fs):
         return ''

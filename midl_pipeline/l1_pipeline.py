@@ -24,8 +24,10 @@ from .l1_downloaders import (
     download_cdaweb_files,
     download_dscovr_ngdc,
     download_position_cdaweb_files,
+    download_solar1_hapi,
+    download_solar1_position_hapi,
 )
-from .l1_readers import cdf_to_df, nc_gz_to_df
+from .l1_readers import cdf_to_df, hapi_csv_to_df, nc_gz_to_df
 
 
 def gse_to_gsm(df, cols):
@@ -302,6 +304,74 @@ def process_satellite_ngdc(day, data_dir, trange_start, trange_end, cleanup=True
                 print(f'  Could not remove {fpath}: {e}')
 
 
+_HAPI_MAG_COL_MAP = {
+    'b_gsm_min_x': 'Bx',
+    'b_gsm_min_y': 'By',
+    'b_gsm_min_z': 'Bz',
+}
+
+
+def process_satellite_hapi(day, data_dir, trange_start, trange_end,
+                           cleanup=True, raw_base='L1_raw'):
+    """Download-phase processing for SOLAR-1 using NCEI HAPI 1-minute MAG.
+
+    Downloads the mag-l3 dataset (GSM, 1-min averaged), resamples to the
+    standard 1-minute grid, and writes L1_solar1.dat to L1_raw/.
+    Plasma columns are filled with NaN (not yet available from SOLAR-1).
+
+    Parameters
+    ----------
+    day : str  ('YYYY-MM-DD')
+    data_dir : str  Scratch directory for temporary downloads.
+    trange_start, trange_end : str  Day boundaries for the output grid.
+    cleanup : bool  Remove downloaded CSV after writing (default True).
+    """
+    print('\nProcessing SOLAR-1 (HAPI)...')
+
+    csv_path = download_solar1_hapi(day, data_dir)
+
+    if csv_path is None:
+        print('  SOLAR-1 mag unavailable for this day.')
+        return
+
+    df_mag = hapi_csv_to_df(csv_path, _HAPI_MAG_COL_MAP)
+
+    if df_mag.empty:
+        print('  SOLAR-1: empty mag DataFrame, skipping.')
+        return
+
+    grid = pd.date_range(start=trange_start, end=trange_end, freq='1min')
+    df_master = pd.DataFrame(index=grid)
+
+    df_mag_res = df_mag.resample('1min').mean().interpolate(
+        method='time', limit=1)
+    df_final = df_master.join(df_mag_res)
+
+    for col in ('Ux', 'Uy', 'Uz', 'rho', 'T'):
+        df_final[col] = np.nan
+
+    check_cols = [c for c in ('Bx', 'By', 'Bz') if c in df_final.columns]
+    if check_cols and df_final[check_cols].isna().all().all():
+        print('  solar1: all mag data is NaN for this day, skipping.')
+    else:
+        dt_start = datetime.strptime(trange_start, '%Y-%m-%d')
+        raw_output_dir = os.path.join(raw_base, dt_start.strftime('%Y/%m/%d'))
+        os.makedirs(raw_output_dir, exist_ok=True)
+        raw_output_file = os.path.join(raw_output_dir, 'L1_solar1.dat')
+        _write_l1_dat(
+            df_final,
+            raw_output_file,
+            'Produced from SOLAR-1 NCEI HAPI mag-l3 (raw)',
+        )
+        print(f'Saved {raw_output_file}')
+
+    if cleanup and csv_path:
+        try:
+            os.remove(csv_path)
+        except Exception as e:
+            print(f'  Could not remove {csv_path}: {e}')
+
+
 _SENTINEL_NAME = '.download_complete'
 
 
@@ -336,6 +406,7 @@ def download_day(day, cda, raw_dir='L1_raw'):
     need_ace = not os.path.exists(os.path.join(day_raw_dir, 'L1_ace.dat'))
     need_wind = not os.path.exists(os.path.join(day_raw_dir, 'L1_wind.dat'))
     need_dscovr = not os.path.exists(os.path.join(day_raw_dir, 'L1_dscovr.dat'))
+    need_solar1 = not os.path.exists(os.path.join(day_raw_dir, 'L1_solar1.dat'))
 
     # Download CDAWeb datasets for ACE + WIND in a single API call.
     if need_ace or need_wind:
@@ -376,6 +447,9 @@ def download_day(day, cda, raw_dir='L1_raw'):
         process_satellite('wind', 'wi_h0_mfi', 'wi_h1_swe',
                           win_map, data_dir, trange_start, trange_end,
                           raw_base=raw_dir)
+    if need_solar1:
+        process_satellite_hapi(day, data_dir, trange_start, trange_end,
+                               raw_base=raw_dir)
 
     # Position file (always recreate -- cheap and needed by combine step).
     create_position_file(day, cda, pos_dir=raw_dir)
@@ -388,7 +462,7 @@ def download_day(day, cda, raw_dir='L1_raw'):
 
 
 def create_position_file(day, cda, cleanup_cdfs=True, pos_dir='L1_raw'):
-    """Write L1_satpos.dat containing mean noon GSM positions for all three satellites.
+    """Write L1_satpos.dat containing mean noon GSM positions for all satellites.
 
     Downloads a narrow 11:00-13:00 UT window of orbit data, averages the
     X/Y/Z positions, and writes a single-row file used by the propagator to
@@ -459,11 +533,26 @@ def create_position_file(day, cda, cleanup_cdfs=True, pos_dir='L1_raw'):
             gse_to_gsm(df_dsc, ['Dx', 'Dy', 'Dz'])
             dsc_mean = df_dsc[['Dx', 'Dy', 'Dz']].mean()
 
+    # SOLAR-1 position from HAPI (already GSM in km).
+    sol_csv = download_solar1_position_hapi(day, data_dir)
+    sol_mean = pd.Series({'Sx': np.nan, 'Sy': np.nan, 'Sz': np.nan})
+    if sol_csv is not None:
+        df_sol = hapi_csv_to_df(
+            sol_csv,
+            {'sat_x_gsm': 'Sx', 'sat_y_gsm': 'Sy', 'sat_z_gsm': 'Sz'},
+            fill_value=-99999,
+        )
+        if not df_sol.empty and {'Sx', 'Sy', 'Sz'}.issubset(df_sol.columns):
+            df_sol[['Sx', 'Sy', 'Sz']] /= 6371.0
+            sol_mean = df_sol[['Sx', 'Sy', 'Sz']].mean()
+
     # Write one merged row for downstream propagation logic.
     with open(output_filepath, 'w', encoding='utf-8') as f:
         f.write(
             f'Multi-Satellite Position File (GSM Coordinates, Re) for {day}\n')
-        f.write('year  mo  dy  hr  mn  sc  Ax  Ay  Az  Dx  Dy  Dz  Wx  Wy  Wz\n')
+        f.write('year  mo  dy  hr  mn  sc  '
+                'Ax  Ay  Az  Dx  Dy  Dz  Wx  Wy  Wz  '
+                'Sx  Sy  Sz  Ix  Iy  Iz\n')
         f.write('#START\n')
 
         def fmt(val):
@@ -473,15 +562,20 @@ def create_position_file(day, cda, cleanup_cdfs=True, pos_dir='L1_raw'):
             f"{dt_day.year:4d} {dt_day.month:2d} {dt_day.day:2d} 12  0  0 "
             f"{fmt(ace_mean['Ax'])} {fmt(ace_mean['Ay'])} {fmt(ace_mean['Az'])} "
             f"{fmt(dsc_mean['Dx'])} {fmt(dsc_mean['Dy'])} {fmt(dsc_mean['Dz'])} "
-            f"{fmt(wind_mean['Wx'])} {fmt(wind_mean['Wy'])} {fmt(wind_mean['Wz'])}\n"
+            f"{fmt(wind_mean['Wx'])} {fmt(wind_mean['Wy'])} {fmt(wind_mean['Wz'])} "
+            f"{fmt(sol_mean['Sx'])} {fmt(sol_mean['Sy'])} {fmt(sol_mean['Sz'])} "
+            f"{fmt(np.nan)} {fmt(np.nan)} {fmt(np.nan)}\n"
         )
         f.write(line)
 
     print(f'Saved {output_filepath}')
 
     # Cleanup raw position files after writing output.
+    cleanup_files = ace_files + wind_files + dsc_files
+    if sol_csv is not None:
+        cleanup_files.append(sol_csv)
     if cleanup_cdfs:
-        for fpath in ace_files + wind_files + dsc_files:
+        for fpath in cleanup_files:
             try:
                 os.remove(fpath)
             except Exception:

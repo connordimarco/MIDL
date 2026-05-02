@@ -3,9 +3,10 @@ l1_readers.py
 -------------
 Low-level file readers that convert raw L1 source files to DataFrames.
 
-Three entry points:
+Four entry points:
   - cdf_to_df()      — NASA CDF files (ACE, WIND, DSCOVR orbit via CDAWeb).
   - nc_gz_to_df()    — Gzipped NetCDF files (DSCOVR 1-min products from NGDC).
+  - hapi_csv_to_df() — HAPI CSV files (SOLAR-1 mag + orbit from NCEI).
   - read_l1_data()   — Custom ASCII .dat files produced by this pipeline.
 
 All return a DataFrame indexed by a DatetimeIndex at 1-min cadence, or an
@@ -166,6 +167,35 @@ def nc_gz_to_df(nc_gz_path, time_var, data_vars):
 
     except Exception as e:
         print(f"Error reading {nc_gz_path}: {e}")
+        return pd.DataFrame()
+
+
+def hapi_csv_to_df(csv_path, col_map, fill_value=-9999):
+    """Read a HAPI-format CSV file into a DataFrame.
+
+    Parameters
+    ----------
+    csv_path : str
+        Path to the CSV file downloaded from a HAPI endpoint.
+    col_map : dict[str, str]
+        Mapping of HAPI parameter name -> output column name.
+    fill_value : float
+        Value treated as missing data (replaced with NaN).
+
+    Returns
+    -------
+    pd.DataFrame  (empty on error)
+    """
+    try:
+        df = pd.read_csv(csv_path, parse_dates=[0], index_col=0)
+        df.index.name = 'timestamp'
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        df = df.rename(columns=col_map)
+        df = df.replace(fill_value, np.nan)
+        return df
+    except Exception as e:
+        print(f'Error reading HAPI CSV {csv_path}: {e}')
         return pd.DataFrame()
 
 

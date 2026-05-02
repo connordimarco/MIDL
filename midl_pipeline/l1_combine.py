@@ -11,6 +11,8 @@ Core responsibilities:
 
 Public functions: combine_data_priority(), combine_temperature()
 """
+from itertools import combinations as _combinations
+
 import numpy as np
 import pandas as pd
 
@@ -18,7 +20,18 @@ from .l1_filters import median_filter_3
 from .l1_quality import score_all_plasma
 
 
-SAT_CODE = {'ace': 1, 'dscovr': 2, 'wind': 3}
+SAT_CODE = {'ace': 1, 'dscovr': 2, 'wind': 3, 'solar1': 4}
+# Code 5 reserved for IMAP (pending data availability).
+# To add IMAP when data is available:
+#   1. pip install imap-data-access
+#   2. Add 'imap': 5 to SAT_CODE
+#   3. Add download function in l1_downloaders.py (query api.imap-mission.com for
+#      instrument=mag, data_level=l2; download CDF; read b_gsm variable)
+#   4. Add process function in l1_pipeline.py
+#   5. Add 'imap' to SATELLITES in l1_midl.py
+#   6. Populate Ix/Iy/Iz position columns in create_position_file()
+#   7. Add color entry in l1_plot.py SAT_COLORS
+#   8. For plasma: SWAPI L3 (bulk moments) needed — not yet in imap-processing
 
 # Variables for which DSCOVR is deprioritized in the 2-satellite fallback.
 # When only DSCOVR + one other satellite are available and they disagree,
@@ -90,7 +103,7 @@ def _select_column_with_continuity(col, sat_series, bad_masks=None,
     # from triggering a source change in the 2-sat no-agreement path.
     _SWITCH_MIN = 3
 
-    index = sat_series['ace'].index
+    index = next(iter(sat_series.values())).index
     out_vals = np.full(len(index), np.nan, dtype=float)
     out_nsat = np.zeros(len(index), dtype=int)
     out_source = [None] * len(index)   # frozenset of sat codes contributing each minute
@@ -128,18 +141,40 @@ def _select_column_with_continuity(col, sat_series, bad_masks=None,
             continue
 
         # Agreement-first logic:
-        #  - all 3 agree -> median
+        #  - all agree -> median of all
+        #  - largest agreeing subset >= 3 -> median of that subset
         #  - any agreeing pair -> mean of that pair
         #  - none agree -> fallback source (WIND at startup, else closest to prev)
         pairs = []
+        pairs_set = set()
         for p_idx, c1 in enumerate(available):
             for c2 in available[p_idx + 1:]:
                 if _agree(values[c1], values[c2], col):
                     pairs.append((c1, c2))
+                    pairs_set.add((c1, c2))
 
-        if n_sat == 3 and len(pairs) == 3:
-            out_vals[i] = np.median([values[1], values[2], values[3]])
-            out_source[i] = frozenset([1, 2, 3])
+        max_pairs = n_sat * (n_sat - 1) // 2
+        if len(pairs) == max_pairs:
+            out_vals[i] = np.median([values[c] for c in available])
+            out_source[i] = frozenset(available)
+            prev_value = out_vals[i]
+            continue
+
+        # Check for a subset of 3+ that all agree pairwise.
+        best_clique = None
+        if n_sat >= 4 and len(pairs) >= 3:
+            for size in range(n_sat - 1, 2, -1):
+                for subset in _combinations(available, size):
+                    if all((a, b) in pairs_set
+                           for a, b in _combinations(subset, 2)):
+                        best_clique = subset
+                        break
+                if best_clique:
+                    break
+
+        if best_clique:
+            out_vals[i] = np.median([values[c] for c in best_clique])
+            out_source[i] = frozenset(best_clique)
             prev_value = out_vals[i]
             continue
 
@@ -217,16 +252,15 @@ def combine_data_priority(data_map, master_grid):
     def _dedup_and_reindex(df, grid):
         return df.reindex(grid)
 
-    df_ace = _dedup_and_reindex(
-        data_map.get('ace', pd.DataFrame(index=master_grid)), master_grid)
-    df_dsc = _dedup_and_reindex(
-        data_map.get('dscovr', pd.DataFrame(index=master_grid)), master_grid)
-    df_win = _dedup_and_reindex(
-        data_map.get('wind', pd.DataFrame(index=master_grid)), master_grid)
+    sat_dfs = {name: _dedup_and_reindex(
+        data_map.get(name, pd.DataFrame(index=master_grid)), master_grid)
+        for name in SAT_CODE}
 
-    # --- Run quality scorer across all three satellites ---
+    # --- Run quality scorer across all satellites ---
     print('  Running plasma quality assessment for all satellites...')
-    all_bad_masks = score_all_plasma(df_ace, df_dsc, df_win)
+    all_bad_by_name = score_all_plasma(sat_dfs)
+    all_bad_masks = {SAT_CODE[name]: masks
+                     for name, masks in all_bad_by_name.items()}
 
     # T is excluded here — handled separately by combine_temperature().
     cols = ['Bx', 'By', 'Bz', 'Ux', 'Uy', 'Uz', 'rho']
@@ -236,17 +270,15 @@ def combine_data_priority(data_map, master_grid):
 
     def _sat_series_for(col):
         return {
-            'ace': df_ace[col] if col in df_ace else pd.Series(np.nan, index=master_grid),
-            'dscovr': df_dsc[col] if col in df_dsc else pd.Series(np.nan, index=master_grid),
-            'wind': df_win[col] if col in df_win else pd.Series(np.nan, index=master_grid),
+            name: sat_dfs[name][col] if col in sat_dfs[name] else pd.Series(
+                np.nan, index=master_grid)
+            for name in SAT_CODE
         }
 
     # --- Block A: Magnetic field (Bx, By, Bz) coupled via |B| ---
-    # Select source based on field magnitude so all three components
-    # always come from the same satellite, preserving div(B) = 0.
     b_series = {comp: _sat_series_for(comp) for comp in ('Bx', 'By', 'Bz')}
     mag_b_series = {}
-    for sat in ('ace', 'dscovr', 'wind'):
+    for sat in SAT_CODE:
         mag_b_series[sat] = np.sqrt(
             b_series['Bx'][sat]**2 +
             b_series['By'][sat]**2 +
@@ -262,22 +294,19 @@ def combine_data_priority(data_map, master_grid):
         source_map[comp] = b_source
 
     # --- Block B: Transverse velocity (Uy, Uz) coupled via |Vt| ---
-    # Select source based on transverse speed so both components come
-    # from the same satellite, preserving vector consistency.
     vt_series = {comp: _sat_series_for(comp) for comp in ('Uy', 'Uz')}
     mag_vt_series = {}
-    for sat in ('ace', 'dscovr', 'wind'):
+    for sat in SAT_CODE:
         mag_vt_series[sat] = np.sqrt(
             vt_series['Uy'][sat]**2 +
             vt_series['Uz'][sat]**2)
 
-    # Combined quality mask: satellite is bad if EITHER Uy or Uz is flagged.
     vt_bad_masks = {}
-    for code in (1, 2, 3):
-        sat_masks = all_bad_masks.get(code)
-        if sat_masks is not None:
-            uy_bad = sat_masks.get('Uy', pd.Series(False, index=master_grid))
-            uz_bad = sat_masks.get('Uz', pd.Series(False, index=master_grid))
+    for name, code in SAT_CODE.items():
+        name_masks = all_bad_by_name.get(name)
+        if name_masks is not None:
+            uy_bad = name_masks.get('Uy', pd.Series(False, index=master_grid))
+            uz_bad = name_masks.get('Uz', pd.Series(False, index=master_grid))
             vt_bad_masks[code] = {'|Vt|': uy_bad | uz_bad}
 
     _, vt_nsat, vt_source = _select_column_with_continuity(
@@ -289,7 +318,7 @@ def combine_data_priority(data_map, master_grid):
         nsat_map[comp] = vt_nsat
         source_map[comp] = vt_source
 
-    # --- Block C: Independent variables (Ux, rho) --- unchanged logic.
+    # --- Block C: Independent variables (Ux, rho) ---
     for col in ('Ux', 'rho'):
         sat_series = _sat_series_for(col)
         depri = _DSCOVR_CODE if col in _DSCOVR_DEPRIORITIZE_VARS else None
@@ -327,12 +356,12 @@ _T_SPIKY_WINDOW = 11
 
 
 def combine_temperature(data_map, master_grid):
-    """Merge proton temperature across ACE, DSCOVR, and WIND.
+    """Merge proton temperature across all L1 satellites.
 
     Parameters
     ----------
     data_map : dict[str, pd.DataFrame]
-        Per-satellite DataFrames keyed by 'ace', 'dscovr', 'wind'.
+        Per-satellite DataFrames keyed by satellite name.
         Each must contain a 'T' column.
     master_grid : pd.DatetimeIndex
         Target 1-minute time grid.
@@ -343,13 +372,11 @@ def combine_temperature(data_map, master_grid):
         Combined temperature on master_grid.
     """
     sat_T = {}
-    for sat in ('ace', 'dscovr', 'wind'):
+    for sat in SAT_CODE:
         if sat in data_map and 'T' in data_map[sat].columns:
             s = data_map[sat]['T'].reindex(master_grid)
             s = s.interpolate(method='time', limit=2, limit_area='inside')
-            # Step 1: per-satellite 3-pt median removes single-minute spikes.
             s = pd.Series(median_filter_3(s.values), index=master_grid)
-            # Step 2: exclude minutes where this satellite's T is too noisy.
             log_std = (
                 np.log(s.clip(lower=1))
                 .rolling(_T_SPIKY_WINDOW, center=True, min_periods=5)
@@ -360,36 +387,29 @@ def combine_temperature(data_map, master_grid):
         else:
             sat_T[sat] = pd.Series(np.nan, index=master_grid)
 
-    # Step 3: geometric median — median in log-space, exponentiated back.
     df = pd.DataFrame(sat_T)
     log_df = np.log(df.clip(lower=1))
     log_median = log_df.median(axis=1, skipna=True)
     out = np.where(df.notna().any(axis=1), np.exp(log_median), np.nan)
 
-    # Deprioritize DSCOVR when exactly 2 satellites available (one being
-    # DSCOVR).  The geometric median of 2 values is just their geometric
-    # mean — no outlier rejection.  Use only the non-DSCOVR value.
     if 'T' in _DSCOVR_DEPRIORITIZE_VARS:
         n_available = df.notna().sum(axis=1)
-        dscovr_present = df['dscovr'].notna()
+        dscovr_present = df['dscovr'].notna() if 'dscovr' in df else False
         mask_2sat_dscovr = (n_available == 2) & dscovr_present
-        non_dscovr = df[['ace', 'wind']].bfill(axis=1).iloc[:, 0]
+        non_dscovr_cols = [s for s in SAT_CODE if s != 'dscovr']
+        non_dscovr = df[non_dscovr_cols].bfill(axis=1).iloc[:, 0]
         out = np.where(mask_2sat_dscovr, non_dscovr.values, out)
 
-    # Track which satellites contributed each minute.
-    sat_codes = {'ace': 1, 'dscovr': 2, 'wind': 3}
     t_source = [None] * len(master_grid)
     for i in range(len(master_grid)):
         contribs = frozenset(
-            sat_codes[sat] for sat in ('ace', 'dscovr', 'wind')
+            SAT_CODE[sat] for sat in SAT_CODE
             if pd.notna(sat_T[sat].iloc[i]))
-        # Remove DSCOVR from provenance when it was deprioritized.
         if 'T' in _DSCOVR_DEPRIORITIZE_VARS and mask_2sat_dscovr.iloc[i]:
             contribs = contribs - {_DSCOVR_CODE}
         t_source[i] = contribs if contribs else None
     t_source = pd.Series(t_source, index=master_grid)
 
     combined = pd.Series(out, index=master_grid)
-    # Step 4: final 3-pt rolling median smooths minute-level residual noise.
     combined = pd.Series(median_filter_3(combined.values), index=master_grid)
     return combined, t_source

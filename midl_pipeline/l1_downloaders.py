@@ -3,19 +3,26 @@ l1_downloaders.py
 -----------------
 Download helpers for raw L1 data files.
 
-Two sources are supported:
+Three sources are supported:
   - CDAWeb  (ACE, WIND, DSCOVR orbit) via the pyspedas CDAWeb client.
   - NOAA NGDC (DSCOVR 1-min plasma + mag) via direct HTTP requests.
+  - NOAA NCEI HAPI (SOLAR-1 mag + orbit) via REST CSV downloads.
 
 Files are written to local scratch directories inside cdf_temp/ and are
 expected to be cleaned up by the calling pipeline after processing.
 """
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 
 import requests
+
+
+_HAPI_BASE = (
+    'https://www.ncei.noaa.gov/cloud-access/space-weather-portal'
+    '/api/v1/hapi/data'
+)
 
 
 def download_cdaweb_files(cda, datasets, trange_start, trange_end, data_dir,
@@ -181,3 +188,110 @@ def download_dscovr_ngdc(day, data_dir, products=('f1m', 'm1m')):
             print(f"  WARNING: Failed to download {file_url}: {e}")
 
     return paths
+
+
+def _download_hapi_csv(dataset, parameters, start, stop, data_dir, local_name,
+                       max_attempts=3, retry_delay=30):
+    """Download a HAPI dataset as CSV and write to a local file.
+
+    Returns the local file path, or None if the dataset had no rows.
+    """
+    url = (
+        f'{_HAPI_BASE}?dataset={dataset}'
+        f'&start={start}&stop={stop}'
+        f'&parameters={parameters}&format=csv'
+    )
+    os.makedirs(data_dir, exist_ok=True)
+    local_path = os.path.join(data_dir, local_name)
+
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.get(url, timeout=120)
+            r.raise_for_status()
+            lines = r.text.strip().split('\n')
+            if len(lines) <= 1:
+                print(f'  SOLAR-1 HAPI: no data rows for {dataset} '
+                      f'({start} – {stop}).')
+                return None
+            with open(local_path, 'w', encoding='utf-8') as f:
+                f.write(r.text)
+            print(f'  Downloaded HAPI {dataset} -> {local_path}')
+            return local_path
+        except Exception as exc:
+            last_error = exc
+            print(f'  WARNING: HAPI {dataset} attempt {attempt} failed: {exc}')
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
+
+    print(f'  WARNING: HAPI {dataset} failed after {max_attempts} attempts: '
+          f'{last_error}')
+    return None
+
+
+def download_solar1_hapi(day, data_dir, max_attempts=3, retry_delay=30):
+    """Download SOLAR-1 1-minute magnetometer data from NCEI HAPI.
+
+    Parameters
+    ----------
+    day : str  ('YYYY-MM-DD')
+    data_dir : str
+    max_attempts : int
+    retry_delay : int | float
+
+    Returns
+    -------
+    str or None
+        Local CSV path, or None if no data was available.
+    """
+    dt = datetime.strptime(day, '%Y-%m-%d')
+    next_day = (dt + timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
+    start = f'{day}T00:00:00Z'
+    date_str = dt.strftime('%Y%m%d')
+
+    return _download_hapi_csv(
+        dataset='mag-l3_solar1',
+        parameters='b_gsm_min_x,b_gsm_min_y,b_gsm_min_z',
+        start=start,
+        stop=next_day,
+        data_dir=data_dir,
+        local_name=f'solar1_mag_{date_str}.csv',
+        max_attempts=max_attempts,
+        retry_delay=retry_delay,
+    )
+
+
+def download_solar1_position_hapi(day, data_dir,
+                                  max_attempts=3, retry_delay=30):
+    """Download SOLAR-1 predicted orbit for a noon window from NCEI HAPI.
+
+    Fetches a narrow 11:00–13:00 UT window to match the existing position
+    download pattern used for ACE/WIND/DSCOVR.
+
+    Parameters
+    ----------
+    day : str  ('YYYY-MM-DD')
+    data_dir : str
+    max_attempts : int
+    retry_delay : int | float
+
+    Returns
+    -------
+    str or None
+        Local CSV path, or None if no data was available.
+    """
+    dt = datetime.strptime(day, '%Y-%m-%d')
+    start = f'{day}T11:00:00Z'
+    stop = f'{day}T13:00:00Z'
+    date_str = dt.strftime('%Y%m%d')
+
+    return _download_hapi_csv(
+        dataset='orb-pr_solar1',
+        parameters='sat_x_gsm,sat_y_gsm,sat_z_gsm',
+        start=start,
+        stop=stop,
+        data_dir=data_dir,
+        local_name=f'solar1_pos_{date_str}.csv',
+        max_attempts=max_attempts,
+        retry_delay=retry_delay,
+    )

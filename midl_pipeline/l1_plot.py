@@ -28,6 +28,7 @@ SAT_COLORS = {
     'ace': ('#1f77b4', 'ACE'),
     'dscovr': ('#ff7f0e', 'DSCOVR'),
     'wind': ('#2ca02c', 'WIND'),
+    'solar1': ('#9467bd', 'SOLAR-1'),
 }
 
 VAR_LABELS = {
@@ -266,7 +267,7 @@ def plot_day_from_csv(data_dir, day_str, output_dir='plots',
     dt = pd.Timestamp(day_str)
     day_path = os.path.join(raw_dir, dt.strftime('%Y/%m/%d'))
     sat_dfs = {}
-    for sat in ('ace', 'dscovr', 'wind'):
+    for sat in SAT_COLORS:
         fpath = os.path.join(day_path, f'L1_{sat}.dat')
         df = read_l1_data(fpath)
         if not df.empty:
@@ -287,7 +288,7 @@ def plot_day_from_csv(data_dir, day_str, output_dir='plots',
 
         # Left column: per-satellite raw data (overlaid).
         ax_left = axes[row_idx, 0]
-        for sat in ('ace', 'dscovr', 'wind'):
+        for sat in SAT_COLORS:
             if sat in sat_dfs and var in sat_dfs[sat].columns:
                 color, sat_label = SAT_COLORS[sat]
                 df_s = sat_dfs[sat]
@@ -315,13 +316,14 @@ def plot_day_from_csv(data_dir, day_str, output_dir='plots',
                 ax.axhline(0, color='k', lw=0.3, alpha=0.3)
 
     # Column titles.
-    axes[0, 0].set_title('ACE / DSCOVR / WIND', fontsize=9)
+    sat_title = ' / '.join(v[1] for v in SAT_COLORS.values())
+    axes[0, 0].set_title(sat_title, fontsize=9)
     axes[0, 1].set_title('MIDL Combined', fontsize=9)
 
     # Legend on top-left panel.
     legend_handles = [Line2D([0], [0], color=SAT_COLORS[s][0], lw=1.0,
                              label=SAT_COLORS[s][1])
-                      for s in ('ace', 'dscovr', 'wind')]
+                      for s in SAT_COLORS]
     axes[0, 0].legend(handles=legend_handles, fontsize=7, loc='upper right',
                       ncol=3)
 

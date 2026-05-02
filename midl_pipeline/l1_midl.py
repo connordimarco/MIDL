@@ -23,6 +23,9 @@ from .l1_readers import read_l1_data
 
 _NUMERIC_COLS = ['Bx', 'By', 'Bz', 'Ux', 'Uy', 'Uz', 'rho', 'T']
 
+SATELLITES = ('ace', 'dscovr', 'wind', 'solar1')
+# When IMAP data becomes available, add 'imap' here.
+
 
 @dataclass
 class MIDLResult:
@@ -42,7 +45,8 @@ class MIDLResult:
         calendar day.  The reference satellite is the one closest to Earth.
     source_map : dict[str, pd.Series]
         Per-variable source provenance. Each Series contains frozenset of
-        satellite codes (1=ACE, 2=DSCOVR, 3=WIND) at each minute.
+        satellite codes (1=ACE, 2=DSCOVR, 3=WIND, 4=SOLAR-1) at each
+        minute.  Code 5 reserved for IMAP.
         Keys: Bx, By, Bz, Ux, Uy, Uz, rho, T.
     mhd_profile : xr.Dataset or None
         1D MHD-propagated solar wind profile produced by BATSRUS when
@@ -78,7 +82,7 @@ def _load_raw_range(raw_dir, start, end):
     Satellites with no data are omitted.
     """
     data_map = {}
-    for sat in ('ace', 'dscovr', 'wind'):
+    for sat in SATELLITES:
         frames = []
         for day_str in _day_range(start, end):
             dt = datetime.strptime(day_str, '%Y-%m-%d')
@@ -95,7 +99,7 @@ def _load_raw_range(raw_dir, start, end):
 
 def _read_sat_positions(pos_file):
     """Read per-satellite noon X positions in km from L1_satpos.dat."""
-    result = {'ace': np.nan, 'dscovr': np.nan, 'wind': np.nan}
+    result = {'ace': np.nan, 'dscovr': np.nan, 'wind': np.nan, 'solar1': np.nan}
     if not os.path.exists(pos_file):
         return result
     try:
@@ -112,6 +116,8 @@ def _read_sat_positions(pos_file):
                     result['ace']    = float(parts[6])  * 6371.0
                     result['dscovr'] = float(parts[9])  * 6371.0
                     result['wind']   = float(parts[12]) * 6371.0
+                    if len(parts) >= 18:
+                        result['solar1'] = float(parts[15]) * 6371.0
                     break
     except Exception as e:
         print(f'  Warning: Could not read position file ({e}).')
@@ -154,7 +160,7 @@ def _propagate_to_reference(data_map, positions):
         pos = positions.get(date)
         if pos is None:
             pos = last_good_pos if last_good_pos else {
-                'ace': np.nan, 'dscovr': np.nan, 'wind': np.nan}
+                sat: np.nan for sat in SATELLITES}
         if any(np.isfinite(v) for v in pos.values()):
             last_good_pos = pos
 
