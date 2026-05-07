@@ -109,7 +109,7 @@ def _read_sat_positions(pos_file):
     """
     result = {'ace': np.nan, 'dscovr': np.nan, 'wind': np.nan, 'solar1': np.nan}
     if not os.path.exists(pos_file):
-        return result
+        return result, set()
     try:
         with open(pos_file, 'r', encoding='utf-8') as f:
             data_started = False
