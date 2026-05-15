@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "smoke: tests using real fixture data files (deselected by default)",
+    "integration: multi-stage pipeline tests",
+]
+addopts = "-m 'not smoke' --strict-markers -v"
+filterwarnings = [
+    "ignore::DeprecationWarning:spacepy",
+    "ignore::DeprecationWarning:cdflib",
+]
