@@ -1,0 +1,3 @@
+[submodule "CSEM-MIDL"]
+	path = CSEM-MIDL
+	url = git@github.com:connordimarco/CSEM-MIDL.git
