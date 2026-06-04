@@ -119,4 +119,11 @@ Full algorithm description in the accompanying manuscript. For tunable parameter
 ## Data Access
 
 - **Website:** [csem.engin.umich.edu/MIDL](https://csem.engin.umich.edu/MIDL/)
-- **Python client:** [CSEM-MIDL](https://github.com/connordimarco/CSEM-MIDL) 
+- **Python client:** [CSEM-MIDL](https://github.com/connordimarco/CSEM-MIDL) — `pip install csem-midl`
+
+## See also
+
+- **[MSWIM2D](https://csem.engin.umich.edu/MSWIM2D/)** — a 2-D MHD model of the
+  solar wind from 1 to 75 AU that uses MIDL L1 data as its inner-boundary input.
+  ([model code](https://github.com/connordimarco/MSWIM2D) ·
+  [Python client `mswim2d`](https://github.com/connordimarco/CSEM-MSWIM2D))
