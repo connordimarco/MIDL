@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite the dataset below."
-title: "MIDL-Pipeline: Merged Interplanetary Data from L1 processing software"
+title: "MIDL: Merged Interplanetary Data from L1 processing software"
 type: software
 authors:
   - family-names: DiMarco
@@ -9,9 +9,11 @@ authors:
     affiliation: University of Michigan
   - family-names: "Tóth"
     given-names: "Gábor"
+    orcid: https://orcid.org/0000-0001-8459-2100
     affiliation: University of Michigan
   - family-names: Pulkkinen
     given-names: Tuija I.
+    orcid: https://orcid.org/0000-0002-6317-381X
     affiliation: University of Michigan
 version: 0.9.0
 date-released: 2026-04-24
@@ -23,10 +25,13 @@ preferred-citation:
   authors:
     - family-names: DiMarco
       given-names: Connor C.
+      orcid: https://orcid.org/0000-0003-0706-4309
     - family-names: "Tóth"
       given-names: "Gábor"
+      orcid: https://orcid.org/0000-0001-8459-2100
     - family-names: Pulkkinen
       given-names: Tuija I.
+      orcid: https://orcid.org/0000-0002-6317-381X
   year: 2026
   publisher: Zenodo
   doi: 10.5281/zenodo.19742679
