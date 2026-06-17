@@ -83,6 +83,41 @@ _SOURCE_COLUMNS = {
     'T_source':   'T',
 }
 
+# Interpolation-provenance flag columns.  Mirror the source-column naming
+# (`<group>_interp`) and map each group to the data column whose presence
+# decides whether the flag is written (blank where that value is missing).
+#   output_col -> (flag-group key in result.interp_flags, gating data column)
+_INTERP_COLUMNS = {
+    'B_interp':   ('B',   'Bx'),
+    'Ux_interp':  ('Ux',  'Ux'),
+    'Uyz_interp': ('Uyz', 'Uy'),
+    'rho_interp': ('rho', 'rho'),
+    'T_interp':   ('T',   'T'),
+}
+
+
+def _attach_interp_flags(df, flag_map):
+    """Add integer `<group>_interp` columns to *df* from *flag_map*.
+
+    flag_map : dict[group -> pd.Series of int]  (provenance levels:
+        0 all-direct, 1 mixed, 2 all-interpolated, 3 Stage-6 fill).
+    A flag cell is left blank (NaN) where the corresponding data value is
+    missing, so provenance is only asserted where there is a value.
+    """
+    if not flag_map:
+        return df
+    for out_col, (group, gate_col) in _INTERP_COLUMNS.items():
+        flag = flag_map.get(group)
+        if flag is None:
+            continue
+        flag = flag.reindex(df.index)
+        if gate_col in df.columns:
+            # Blank the flag where the value itself is absent.
+            flag = flag.where(df[gate_col].notna())
+        # Nullable integer so blanks stay blank (no trailing .0) in CSV.
+        df[out_col] = flag.astype('Int64')
+    return df
+
 
 def _prepare_datasets(result):
     """Build dict of {label: DataFrame} from MIDLResult.
@@ -104,9 +139,15 @@ def _prepare_datasets(result):
                 df_unp[out_col] = src.map(
                     lambda fs: _frozenset_to_str(fs) or float('nan'))
 
+    # Add interpolation-provenance flag columns (additive).
+    df_unp = _attach_interp_flags(df_unp, getattr(result, 'interp_flags', None))
+
     datasets['L1'] = df_unp
 
+    prop_flags = getattr(result, 'propagated_interp_flags', None) or {}
     for b_re, df in result.propagated.items():
+        df = df.copy()
+        df = _attach_interp_flags(df, prop_flags.get(b_re))
         datasets[f'{b_re}Re'] = df
 
     return datasets

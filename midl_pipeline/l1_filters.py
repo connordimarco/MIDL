@@ -30,7 +30,7 @@ INTERP_LIMITS = {
 }
 
 
-def interpolate_with_limits(df, limits=None, method='time'):
+def interpolate_with_limits(df, limits=None, method='time', return_mask=False):
     """Interpolate each column with a per-variable max gap limit.
 
     Parameters
@@ -41,17 +41,38 @@ def interpolate_with_limits(df, limits=None, method='time'):
         Defaults to INTERP_LIMITS.
     method : str
         Interpolation method passed to pandas (default 'time').
+    return_mask : bool
+        When True, also return a DataFrame of boolean masks (same index,
+        one column per interpolated variable) that are True at cells which
+        changed from NaN to non-NaN — i.e. the gap-filled cells. The masks
+        are purely diagnostic; the numeric output is byte-for-byte identical
+        whether or not this flag is set.
+
+    Returns
+    -------
+    out : pd.DataFrame
+        Interpolated copy of *df* (always returned).
+    fill_mask : pd.DataFrame
+        Only when ``return_mask`` is True. Boolean, True where a NaN was
+        filled by interpolation.
     """
     if limits is None:
         limits = INTERP_LIMITS
     out = df.copy()
+    fill_mask = {}
     for col, limit in limits.items():
         if col in out.columns:
+            before_nan = out[col].isna()
             out[col] = out[col].infer_objects(copy=False).interpolate(
                 method=method,
                 limit=limit,
                 limit_area='inside',
             )
+            if return_mask:
+                # Cells that were NaN before and are now finite were filled.
+                fill_mask[col] = before_nan & out[col].notna()
+    if return_mask:
+        return out, pd.DataFrame(fill_mask, index=out.index)
     return out
 
 
@@ -167,22 +188,35 @@ def smooth_transitions(df, source_changed=None, cmax=_CMAX_DEFAULT,
     return out
 
 
-def despike(df):
+def despike(df, return_mask=False):
     """Apply a centered 3-point median filter to B and plasma columns.
 
     Parameters
     ----------
     df : pd.DataFrame
         Combined L1 data with columns Bx/By/Bz/Ux/Uy/Uz/rho.
+    return_mask : bool
+        If True, also return a boolean DataFrame marking cells the median
+        filter reconstructed from neighbors (NaN before, finite after).  The
+        filter bridges isolated single-minute dropouts, so those cells are
+        provenance-interpolated, not direct.
 
     Returns
     -------
     df_clean : pd.DataFrame
         Copy of *df* with the median filter applied.
+    bridge_mask : pd.DataFrame
+        Only returned when *return_mask* is True (see above).
     """
     print('  -> Running Despike (3-point median)...')
     df_clean = df.copy()
+    bridge_mask = {}
     for col in ['Bx', 'By', 'Bz', 'Ux', 'Uy', 'Uz', 'rho']:
         if col in df_clean.columns:
+            before_nan = df_clean[col].isna()
             df_clean[col] = median_filter_3(df_clean[col].values)
+            if return_mask:
+                bridge_mask[col] = before_nan & df_clean[col].notna()
+    if return_mask:
+        return df_clean, pd.DataFrame(bridge_mask, index=df_clean.index)
     return df_clean

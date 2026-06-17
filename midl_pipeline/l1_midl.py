@@ -23,6 +23,11 @@ from .l1_readers import read_l1_data
 
 _NUMERIC_COLS = ['Bx', 'By', 'Bz', 'Ux', 'Uy', 'Uz', 'rho', 'T']
 
+# Suffix for per-satellite interpolation-provenance companion columns.
+# These ride through propagation as float 0.0/1.0 and are binarized back.
+_INTERP_SUFFIX = '_interp'
+_INTERP_VARS = _NUMERIC_COLS  # one flag column per numeric variable
+
 SATELLITES = ('ace', 'dscovr', 'wind', 'solar1')
 # When IMAP data becomes available, add 'imap' here.
 
@@ -55,12 +60,29 @@ class MIDLResult:
         grid), data vars Bx/By/Bz/Ux/Uy/Uz/rho/T, plus a
         No NaN masking — BATSRUS output is kept everywhere.  None when
         MHD is disabled.
+    interp_flags : dict[str, pd.Series] or None
+        Interpolation-provenance flags for the unpropagated (L1) product,
+        keyed by output group ('B', 'Ux', 'Uyz', 'rho', 'T').  Each Series
+        is integer-valued on the L1 index:
+        0 = all contributing values are direct observations;
+        1 = mixed — at least one contributing satellite value was produced
+            by Stage-2 gap interpolation AND at least one is direct;
+        2 = ALL contributing values were produced by interpolation.
+        (Value 3 cannot occur for L1, which has no post-propagation
+        interpolation pass.)
+    propagated_interp_flags : dict[int, dict[str, pd.Series]] or None
+        Same flag groups for each propagated boundary, keyed by boundary Re
+        then group.  Adds value 3 = the minute was filled by the
+        post-propagation (Stage-6) interpolation pass (no direct or
+        Stage-2 value at all).
     """
     unpropagated: pd.DataFrame
     propagated: dict
     ref_x_re: dict
     source_map: dict
     mhd_profile: "object" = None
+    interp_flags: dict = None
+    propagated_interp_flags: dict = None
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +300,100 @@ def _compute_source_changed(source_map):
     return source_changed
 
 
+# Output flag groups -> the per-satellite variable flags that feed them.
+# Mirrors the five source groups (B, Ux, Uyz, rho, T).
+_FLAG_GROUPS = {
+    'B':   ('Bx', 'By', 'Bz'),
+    'Ux':  ('Ux',),
+    'Uyz': ('Uy', 'Uz'),
+    'rho': ('rho',),
+    'T':   ('T',),
+}
+
+# source_map keys that carry the contributing-satellite frozensets for each
+# output flag group.
+_FLAG_GROUP_SOURCE_KEY = {
+    'B':   'Bx',    # Bx/By/Bz share the same source decision
+    'Ux':  'Ux',
+    'Uyz': 'Uy',    # Uy/Uz share the same source decision
+    'rho': 'rho',
+    'T':   'T',
+}
+
+
+def _build_stage2_flags(data_map, source_map, master_grid):
+    """Merge per-satellite Stage-2 interp flags into per-group output levels.
+
+    For each output flag group and each minute, counts how many of the
+    *contributing* satellites (source_map frozenset) had an interpolated
+    value for that group at that minute:
+
+        0 — all contributing values are direct observations
+        1 — mixed: >=1 contributing value interpolated AND >=1 direct
+        2 — ALL contributing values interpolated
+
+    A satellite's group value counts as interpolated when any of its
+    component variables in the group was gap-filled (e.g. B: Bx|By|Bz).
+    Returns dict[group -> pd.Series of int (0/1/2)] on master_grid.
+
+    Purely diagnostic — does not affect any numeric output column.
+    """
+    from .l1_combine import SAT_CODE
+    code_to_sat = {v: k for k, v in SAT_CODE.items()}
+
+    # Per-satellite, per-variable flag series aligned to the master grid.
+    # Missing satellites / columns default to all-False.
+    sat_flag = {}
+    for sat in SAT_CODE:
+        df = data_map.get(sat)
+        sat_flag[sat] = {}
+        for var in _INTERP_VARS:
+            col = f'{var}{_INTERP_SUFFIX}'
+            if df is not None and col in df.columns:
+                s = df[col].reindex(master_grid)
+                sat_flag[sat][var] = s.fillna(False).astype(bool)
+            else:
+                sat_flag[sat][var] = pd.Series(False, index=master_grid)
+
+    group_flags = {}
+    for group, vars_in_group in _FLAG_GROUPS.items():
+        src_key = _FLAG_GROUP_SOURCE_KEY[group]
+        src = source_map.get(src_key)
+        out_vals = np.zeros(len(master_grid), dtype=np.int64)
+        if src is None:
+            group_flags[group] = pd.Series(out_vals, index=master_grid)
+            continue
+        src = src.reindex(master_grid)
+        src_vals = src.values
+        # Pre-extract per-sat, per-var boolean arrays for speed.
+        arrs = {sat: {v: sat_flag[sat][v].values for v in vars_in_group}
+                for sat in SAT_CODE}
+        for i in range(len(master_grid)):
+            codes = src_vals[i]
+            if codes is None:
+                continue
+            n_contrib = 0
+            n_flagged = 0
+            for c in codes:
+                sat = code_to_sat.get(c)
+                if sat is None:
+                    continue
+                n_contrib += 1
+                for v in vars_in_group:
+                    if arrs[sat][v][i]:
+                        n_flagged += 1
+                        break
+            if n_contrib == 0 or n_flagged == 0:
+                continue            # 0: all direct (or nothing to assess)
+            elif n_flagged == n_contrib:
+                out_vals[i] = 2     # all contributing values interpolated
+            else:
+                out_vals[i] = 1     # mixed: interpolated + direct
+        group_flags[group] = pd.Series(out_vals, index=master_grid)
+
+    return group_flags
+
+
 def _propagate_to_boundary(df_combined, ref_x_daily, target_km):
     """Propagate combined data to a fixed boundary using per-day reference X.
 
@@ -385,15 +501,39 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
             mhd_profile=None,
         )
 
-    # Stage 1: Despike.
+    # Stage 1: Despike.  Capture the median filter's NaN->finite bridges (it
+    # reconstructs isolated single-minute dropouts), so they count as
+    # interpolated, not direct, when the provenance flag is built in Stage 2.
     print('Despiking...')
+    despike_bridge = {}
     for sat in data_map:
-        data_map[sat] = despike(data_map[sat])
+        data_map[sat], despike_bridge[sat] = despike(
+            data_map[sat], return_mask=True)
 
     # Stage 2: Interpolate per-satellite gaps.
+    #
+    # Provenance flags (additive only — does not change numeric output):
+    # interpolate_with_limits returns a boolean mask of which cells were
+    # gap-filled.  We attach those masks as companion `<var>_interp` columns
+    # on each satellite's frame so they ride through the ballistic time-shift
+    # with their parent rows and can be merged with the same source selection
+    # as the data in Stage 4.
     print('Interpolating gaps...')
     for sat in data_map:
-        data_map[sat] = interpolate_with_limits(data_map[sat], INTERP_LIMITS)
+        filled, mask = interpolate_with_limits(
+            data_map[sat], INTERP_LIMITS, return_mask=True)
+        bridge = despike_bridge[sat]
+        for col in mask.columns:
+            # A cell is interpolated if Stage-1 despike bridged it OR Stage-2
+            # gap-fill filled it (T has no despike bridge).  Store as float
+            # 0.0/1.0 so the flags survive the numeric-only regridding inside
+            # ballistic_propagation (which drops non-numeric columns).
+            # Binarized back to bool after propagation.
+            cell = mask[col]
+            if col in bridge.columns:
+                cell = cell | bridge[col]
+            filled[f'{col}{_INTERP_SUFFIX}'] = cell.astype(float)
+        data_map[sat] = filled
 
     # Stage 3: Propagate to reference position.
     print('Propagating to reference positions...')
@@ -408,6 +548,18 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
             df = df.sort_values('Ux', ascending=True)
             data_map[sat] = df[~df.index.duplicated(keep='first')]
 
+    # Binarize the interpolation-flag companion columns.  The ballistic
+    # regridding interpolates numerically (reindex + interpolate(limit=2)
+    # jitter snapping), so a 0/1 flag can land as a fractional value at a
+    # snapped minute.  Treat any positive fraction as "flagged" (a flagged
+    # parent row contributed to this minute) — conservative by design.
+    for sat in data_map:
+        df = data_map[sat]
+        flag_cols = [c for c in df.columns if c.endswith(_INTERP_SUFFIX)]
+        for c in flag_cols:
+            df[c] = (df[c].fillna(0.0) > 0.0)
+        data_map[sat] = df
+
     # Build master grid spanning the full padded window.
     grid_start = load_start
     grid_end = load_end + pd.Timedelta(days=1)
@@ -421,8 +573,20 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
         data_map, master_grid)
 
     print('Combining temperature...')
-    df_combined['T'], t_source = combine_temperature(data_map, master_grid)
+    # Per-satellite Stage-2 T interp flags, for the merged T provenance flag.
+    t_interp_flags = {}
+    t_flag_col = f'T{_INTERP_SUFFIX}'
+    for sat in data_map:
+        if t_flag_col in data_map[sat].columns:
+            t_interp_flags[sat] = data_map[sat][t_flag_col]
+    df_combined['T'], t_source, t_interp_flag = combine_temperature(
+        data_map, master_grid, t_interp_flags=t_interp_flags, return_flag=True)
     source_map['T'] = t_source
+
+    # Build merged Stage-2 interp flags for the five output groups.
+    # (Additive provenance only — df_combined values are unchanged.)
+    stage2_flags = _build_stage2_flags(data_map, source_map, master_grid)
+    stage2_flags['T'] = t_interp_flag
 
     # Stage 5: Smooth transitions.
     print('Smoothing transitions...')
@@ -430,15 +594,93 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
     df_combined = smooth_transitions(
         df_combined, source_changed=source_changed)
 
+    # Representative data column whose Stage-6 fill defines each group's
+    # flag=3 (the group value at that minute was produced by the
+    # post-propagation interpolation pass).
+    _GROUP_REPR_COL = {'B': 'Bx', 'Ux': 'Ux', 'Uyz': 'Uy', 'rho': 'rho',
+                       'T': 'T'}
+    # Internal float carrier suffixes for the merged Stage-2 flag levels so
+    # they survive ballistic_propagation's numeric-only regridding.  The
+    # 0/1/2 level cannot be carried as one number (regridding blends
+    # numerically), so it is decomposed into two monotone booleans:
+    #   any  = level >= 1  (some contributing value interpolated)
+    #   all  = level == 2  (every contributing value interpolated)
+    # After regridding, a snapped minute blends <=2 parent rows:
+    #   any  := blend > 0   (any flagged parent contributed)
+    #   all  := blend == 1  (every contributing parent was all-interpolated)
+    _CARRY_ANY = '__interp_any'
+    _CARRY_ALL = '__interp_all'
+
+    # Attach the carriers to the combined frame as floats so they ride
+    # through _propagate_to_boundary with their parent rows.
+    df_combined_f = df_combined.copy()
+    for group, flag in stage2_flags.items():
+        lev = flag.reindex(df_combined_f.index).fillna(0).astype(int)
+        df_combined_f[f'{group}{_CARRY_ANY}'] = (lev >= 1).astype(float)
+        df_combined_f[f'{group}{_CARRY_ALL}'] = (lev >= 2).astype(float)
+
+    # Per-group provenance flag series for the unpropagated (L1) product:
+    # exactly the Stage-2 levels (L1 has no Stage-6 boundary pass, so no 3).
+    unprop_flags = {g: stage2_flags[g].reindex(df_combined.index)
+                    for g in _FLAG_GROUPS}
+
     # Stage 6: Propagate to boundaries.
     propagated = {}
+    propagated_flags = {}
     for b_re in boundaries_re:
         target_km = b_re * 6371.0
         print(f'Propagating to {b_re} Re ({target_km:.0f} km)...')
-        propagated[b_re] = _propagate_to_boundary(
-            df_combined, ref_x_daily, target_km)
-        propagated[b_re] = interpolate_with_limits(
-            propagated[b_re], INTERP_LIMITS)
+        prop = _propagate_to_boundary(
+            df_combined_f, ref_x_daily, target_km)
+
+        # NaN mask of each group's representative column BEFORE the final
+        # interpolation pass — used to detect Stage-6 (flag=3) fills.
+        pre_nan = {g: prop[col].isna()
+                   for g, col in _GROUP_REPR_COL.items()
+                   if col in prop.columns}
+
+        prop = interpolate_with_limits(prop, INTERP_LIMITS)
+
+        # Build the per-group boundary flags.
+        b_flags = {}
+        for g in _FLAG_GROUPS:
+            c_any = f'{g}{_CARRY_ANY}'
+            c_all = f'{g}{_CARRY_ALL}'
+            # Binarize the smeared carriers:
+            #   any: any positive fraction means a flagged parent row
+            #        contributed (conservative toward "interpolated").
+            #   all: only an exact 1.0 blend means every contributing parent
+            #        was all-interpolated (a blend with any direct-backed
+            #        parent is by construction mixed).
+            if c_any in prop.columns:
+                any_f = prop[c_any].fillna(0.0) > 0.0
+            else:
+                any_f = pd.Series(False, index=prop.index)
+            if c_all in prop.columns:
+                all_f = prop[c_all].fillna(0.0) >= 1.0 - 1e-9
+            else:
+                all_f = pd.Series(False, index=prop.index)
+            all_f = all_f & any_f   # 'all' cannot hold without 'any'
+
+            col = _GROUP_REPR_COL[g]
+            if g in pre_nan and col in prop.columns:
+                filled_now = pre_nan[g] & prop[col].notna()  # NaN -> finite
+            else:
+                filled_now = pd.Series(False, index=prop.index)
+
+            # Level: 0 all-direct, 1 mixed, 2 all-interpolated,
+            # 3 Stage-6 filled; blank handled later where the value is NaN.
+            flag = pd.Series(0, index=prop.index, dtype='int64')
+            flag = flag.mask(any_f, 1)
+            flag = flag.mask(all_f, 2)
+            flag = flag.mask(filled_now, 3)
+            b_flags[g] = flag
+
+        # Drop the internal carrier columns from the numeric output.
+        prop = prop.drop(columns=[c for c in prop.columns
+                                  if c.endswith((_CARRY_ANY, _CARRY_ALL))])
+        propagated[b_re] = prop
+        propagated_flags[b_re] = b_flags
 
     # Stage 6b: 1D MHD propagation (optional).
     # Uses a restart loop: if BATSRUS crashes mid-run, recover whatever
@@ -525,10 +767,15 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
             (df_combined.index < result_end))
 
     result_propagated = {}
+    result_propagated_flags = {}
     for b_re, df_prop in propagated.items():
         prop_mask = ((df_prop.index >= result_start) &
                      (df_prop.index < result_end))
         result_propagated[b_re] = df_prop.loc[prop_mask].copy()
+        result_propagated_flags[b_re] = {
+            g: f.loc[(f.index >= result_start) & (f.index < result_end)].copy()
+            for g, f in propagated_flags[b_re].items()
+        }
 
     # Convert reference positions from km back to Re.
     ref_x_re = {date: x_km / 6371.0 for date, x_km in ref_x_daily.items()}
@@ -538,6 +785,12 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
     for col, src in source_map.items():
         src_mask = ((src.index >= result_start) & (src.index < result_end))
         result_source_map[col] = src.loc[src_mask].copy()
+
+    # Slice unpropagated (L1) provenance flags to requested range.
+    result_unprop_flags = {}
+    for g, f in unprop_flags.items():
+        f_mask = ((f.index >= result_start) & (f.index < result_end))
+        result_unprop_flags[g] = f.loc[f_mask].copy()
 
     # Slice MHD profile to requested range (same window as ballistic).
     if mhd_profile is not None:
@@ -551,4 +804,6 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
         ref_x_re=ref_x_re,
         source_map=result_source_map,
         mhd_profile=mhd_profile,
+        interp_flags=result_unprop_flags,
+        propagated_interp_flags=result_propagated_flags,
     )

@@ -351,7 +351,8 @@ _T_SPIKY_LOG_STD = 0.5
 _T_SPIKY_WINDOW = 11
 
 
-def combine_temperature(data_map, master_grid):
+def combine_temperature(data_map, master_grid, t_interp_flags=None,
+                        return_flag=False):
     """Merge proton temperature across all L1 satellites.
 
     Parameters
@@ -361,17 +362,51 @@ def combine_temperature(data_map, master_grid):
         Each must contain a 'T' column.
     master_grid : pd.DatetimeIndex
         Target 1-minute time grid.
+    t_interp_flags : dict[str, pd.Series] or None
+        Optional per-satellite boolean Stage-2 interpolation flags for T
+        (True where that satellite's T at that minute was gap-filled before
+        this function ran).  Used to compute the merged T provenance flag.
+    return_flag : bool
+        When True, also return an integer Series ``t_interp`` on master_grid
+        scoring the *contributing* satellites' T provenance at each minute
+        (interpolated = upstream Stage-2 fill via ``t_interp_flags`` OR this
+        function's internal 2-minute pre-fill):
+
+            0 — all contributing values direct,
+            1 — mixed (some interpolated, some direct),
+            2 — ALL contributing values interpolated.
 
     Returns
     -------
-    pd.Series
+    combined : pd.Series
         Combined temperature on master_grid.
+    t_source : pd.Series
+        Per-minute frozenset of contributing satellite codes.
+    t_interp : pd.Series of int (0/1/2)
+        Only when ``return_flag`` is True.
+
+    Notes
+    -----
+    The numeric outputs (``combined``, ``t_source``) are identical whether
+    or not ``return_flag`` is set — the flag machinery is additive only.
     """
     sat_T = {}
+    # Per-satellite boolean: True where the value used here came from
+    # interpolation (upstream Stage-2 fill OR this routine's 2-min pre-fill).
+    sat_T_interp = {}
     for sat in SAT_CODE:
         if sat in data_map and 'T' in data_map[sat].columns:
-            s = data_map[sat]['T'].reindex(master_grid)
-            s = s.interpolate(method='time', limit=2, limit_area='inside')
+            raw = data_map[sat]['T'].reindex(master_grid)
+            s = raw.interpolate(method='time', limit=2, limit_area='inside')
+            # Cells the 2-min pre-fill turned from NaN into finite values.
+            prefill = raw.isna() & s.notna()
+            # Upstream Stage-2 flag for this satellite's T, aligned here.
+            upstream = (t_interp_flags.get(sat) if t_interp_flags else None)
+            if upstream is not None:
+                upstream = upstream.reindex(master_grid).fillna(False).astype(bool)
+            else:
+                upstream = pd.Series(False, index=master_grid)
+            sat_T_interp[sat] = (prefill | upstream)
             s = pd.Series(median_filter_3(s.values), index=master_grid)
             log_std = (
                 np.log(s.clip(lower=1))
@@ -382,6 +417,7 @@ def combine_temperature(data_map, master_grid):
             sat_T[sat] = s
         else:
             sat_T[sat] = pd.Series(np.nan, index=master_grid)
+            sat_T_interp[sat] = pd.Series(False, index=master_grid)
 
     df = pd.DataFrame(sat_T)
     log_df = np.log(df.clip(lower=1))
@@ -408,4 +444,36 @@ def combine_temperature(data_map, master_grid):
 
     combined = pd.Series(out, index=master_grid)
     combined = pd.Series(median_filter_3(combined.values), index=master_grid)
-    return combined, t_source
+
+    if not return_flag:
+        return combined, t_source
+
+    # Merged T provenance level over the *contributing* satellites' interp
+    # flags (same contributing set as t_source — a satellite contributes iff
+    # its post-spiky sat_T value is finite at that minute):
+    #   0 = none interpolated, 1 = mixed, 2 = all interpolated.
+    code_to_sat = {v: k for k, v in SAT_CODE.items()}
+    t_interp_vals = np.zeros(len(master_grid), dtype=np.int64)
+    interp_arr = {sat: sat_T_interp[sat].values for sat in SAT_CODE}
+    src_vals = t_source.values
+    for i in range(len(master_grid)):
+        codes = src_vals[i]
+        if codes is None:
+            continue
+        n_contrib = 0
+        n_flagged = 0
+        for c in codes:
+            sat = code_to_sat.get(c)
+            if sat is None:
+                continue
+            n_contrib += 1
+            if interp_arr[sat][i]:
+                n_flagged += 1
+        if n_contrib == 0 or n_flagged == 0:
+            continue                  # 0: all direct
+        elif n_flagged == n_contrib:
+            t_interp_vals[i] = 2      # all contributing values interpolated
+        else:
+            t_interp_vals[i] = 1      # mixed
+    t_interp = pd.Series(t_interp_vals, index=master_grid)
+    return combined, t_source, t_interp
