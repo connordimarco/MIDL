@@ -30,6 +30,60 @@ INTERP_LIMITS = {
 }
 
 
+def drop_isolated_minutes(mask):
+    """Return a copy of boolean Series *mask* with isolated single-minute
+    True cells set to False.
+
+    A True cell is "isolated" when neither its 1-minute-earlier nor its
+    1-minute-later neighbor (compared by timestamp, not by position) is also
+    True.  Cells whose +/-1-minute neighbor is absent from the index (a record
+    boundary or a real data gap) are treated as having a not-True neighbor on
+    that side, so a lone True next to a gap is still isolated.  Multi-minute
+    True runs (two or more consecutive 1-minute cells) are preserved unchanged.
+
+    Used to exclude single-minute plasma gap fills from the interpolation
+    provenance flags: a one-minute plasma fill sits below the native plasma
+    cadence and under the despike median-filter resolution, so it is not
+    flagged as interpolated.  The index is assumed to be a DatetimeIndex.
+    """
+    if mask is None or len(mask) == 0:
+        return mask
+    idx = mask.index
+    m = mask.to_numpy(dtype=bool, copy=True)
+    one = pd.Timedelta(minutes=1)
+    # Is row i's previous row exactly one minute earlier?
+    prev_adj = (idx.to_series().diff() == one).to_numpy()
+    # Is row i's next row exactly one minute later? (shift prev_adj back by one)
+    next_adj = np.zeros(len(m), dtype=bool)
+    next_adj[:-1] = prev_adj[1:]
+    # A True neighbor on a side requires both 1-minute adjacency and that the
+    # neighbor cell is itself True.
+    left_true = np.zeros(len(m), dtype=bool)
+    left_true[1:] = m[:-1]
+    right_true = np.zeros(len(m), dtype=bool)
+    right_true[:-1] = m[1:]
+    isolated = m & ~(prev_adj & left_true) & ~(next_adj & right_true)
+    m[isolated] = False
+    return pd.Series(m, index=idx)
+
+
+def bracketing_or_fill(s, limit):
+    """Fill NaN gaps of a monotone boolean carrier with the OR of the two
+    bracketing endpoints (each forward/back-filled up to *limit* steps).
+
+    *s* is a float Series carrying 0.0/1.0 with NaN over gaps to fill.  For a
+    monotone boolean level, the "worse (max) of the two bracketing values" over
+    an interior gap is True iff either the nearest preceding or nearest
+    following observed value (within *limit* steps) is True.  Returns a boolean
+    Series the same length as *s*; cells beyond *limit* of any endpoint are
+    False.  Used to carry interpolation-provenance levels across a propagation
+    gap so the fill inherits the worse status of its neighbors.
+    """
+    fwd = s.ffill(limit=limit).fillna(0.0).astype(bool)
+    bwd = s.bfill(limit=limit).fillna(0.0).astype(bool)
+    return fwd | bwd
+
+
 def interpolate_with_limits(df, limits=None, method='time', return_mask=False):
     """Interpolate each column with a per-variable max gap limit.
 
@@ -180,7 +234,9 @@ def smooth_transitions(df, source_changed=None, cmax=_CMAX_DEFAULT,
             c = _jump_magnitude(m1, m2, col_type)
             if c <= cmax:
                 continue
-            w = max(2, int(np.round(min(wmax, c / rate))))
+            # Smoothing only triggers for C > cmax (=20), so C/rate (=C/5) > 4
+            # and the rounded window is always >= 4; no explicit floor needed.
+            w = int(np.round(min(wmax, c / rate)))
             _apply_boxcar(smoothed, original, i, w)
 
         out[col] = smoothed

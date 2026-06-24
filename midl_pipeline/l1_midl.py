@@ -16,7 +16,8 @@ import numpy as np
 import pandas as pd
 
 from .l1_combine import combine_data_priority, combine_temperature
-from .l1_filters import despike, interpolate_with_limits, smooth_transitions, INTERP_LIMITS
+from .l1_filters import (despike, interpolate_with_limits, smooth_transitions,
+                         drop_isolated_minutes, bracketing_or_fill, INTERP_LIMITS)
 from .l1_propagation import ballistic_propagation
 from .l1_readers import read_l1_data
 
@@ -27,6 +28,13 @@ _NUMERIC_COLS = ['Bx', 'By', 'Bz', 'Ux', 'Uy', 'Uz', 'rho', 'T']
 # These ride through propagation as float 0.0/1.0 and are binarized back.
 _INTERP_SUFFIX = '_interp'
 _INTERP_VARS = _NUMERIC_COLS  # one flag column per numeric variable
+
+# Plasma variables for which single-minute gap fills are NOT flagged as
+# interpolated (the fill sits below the native plasma cadence and under the
+# despike median-filter resolution).  The magnetic field (Bx/By/Bz) keeps
+# single-minute fills flagged, since B varies fast and is measured at high
+# cadence.
+_PLASMA_INTERP_VARS = {'Ux', 'Uy', 'Uz', 'rho', 'T'}
 
 SATELLITES = ('ace', 'dscovr', 'wind', 'solar1')
 # When IMAP data becomes available, add 'imap' here.
@@ -66,15 +74,16 @@ class MIDLResult:
         is integer-valued on the L1 index:
         0 = all contributing values are direct observations;
         1 = mixed — at least one contributing satellite value was produced
-            by Stage-2 gap interpolation AND at least one is direct;
+            by gap interpolation AND at least one is direct;
         2 = ALL contributing values were produced by interpolation.
-        (Value 3 cannot occur for L1, which has no post-propagation
-        interpolation pass.)
+        Single-minute plasma fills are not flagged (treated as direct); the
+        magnetic field keeps single-minute fills flagged.
     propagated_interp_flags : dict[int, dict[str, pd.Series]] or None
-        Same flag groups for each propagated boundary, keyed by boundary Re
-        then group.  Adds value 3 = the minute was filled by the
-        post-propagation (Stage-6) interpolation pass (no direct or
-        Stage-2 value at all).
+        Same 0/1/2 flag groups for each propagated boundary, keyed by boundary
+        Re then group.  A minute filled by the post-propagation pass inherits
+        the worse (max) of the two bracketing minutes' levels (a gap between
+        two direct minutes is therefore flagged direct, 0), so no separate
+        "post-propagation fill" level is emitted.
     """
     unpropagated: pd.DataFrame
     propagated: dict
@@ -532,6 +541,10 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
             cell = mask[col]
             if col in bridge.columns:
                 cell = cell | bridge[col]
+            # Plasma: a single isolated minute fill is not flagged (below the
+            # native plasma cadence / median-filter resolution).  B keeps it.
+            if col in _PLASMA_INTERP_VARS:
+                cell = drop_isolated_minutes(cell)
             filled[f'{col}{_INTERP_SUFFIX}'] = cell.astype(float)
         data_map[sat] = filled
 
@@ -594,11 +607,11 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
     df_combined = smooth_transitions(
         df_combined, source_changed=source_changed)
 
-    # Representative data column whose Stage-6 fill defines each group's
-    # flag=3 (the group value at that minute was produced by the
-    # post-propagation interpolation pass).
-    _GROUP_REPR_COL = {'B': 'Bx', 'Ux': 'Ux', 'Uyz': 'Uy', 'rho': 'rho',
-                       'T': 'T'}
+    # Representative data column per group, used to look up the per-group
+    # gap-fill limit from INTERP_LIMITS (B groups -> 5 min, plasma -> 60 min)
+    # when carrying the provenance carriers across a propagation gap.
+    _GROUP_REPR_COL_FOR_LIMIT = {'B': 'Bx', 'Ux': 'Ux', 'Uyz': 'Uy',
+                                 'rho': 'rho', 'T': 'T'}
     # Internal float carrier suffixes for the merged Stage-2 flag levels so
     # they survive ballistic_propagation's numeric-only regridding.  The
     # 0/1/2 level cannot be carried as one number (regridding blends
@@ -633,20 +646,36 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
         prop = _propagate_to_boundary(
             df_combined_f, ref_x_daily, target_km)
 
-        # NaN mask of each group's representative column BEFORE the final
-        # interpolation pass — used to detect Stage-6 (flag=3) fills.
-        pre_nan = {g: prop[col].isna()
-                   for g, col in _GROUP_REPR_COL.items()
-                   if col in prop.columns}
-
         prop = interpolate_with_limits(prop, INTERP_LIMITS)
+
+        # Carry the provenance carriers across each propagation gap.  The
+        # carriers are not in INTERP_LIMITS, so the fill above left them NaN
+        # across every gap the data fill bridged.  A gap-filled minute should
+        # inherit the WORSE (max) of the two bracketing levels: physically the
+        # ballistic fill is a rarefaction/deceleration profile, not missing
+        # data, so it carries the observation/fill status of its neighbors
+        # rather than a distinct "fill" label.  For a monotone boolean carrier,
+        # "worse of the two endpoints" is the OR of its forward- and back-fill,
+        # bounded to the same per-group gap limit the data fill used.
+        for g in _FLAG_GROUPS:
+            limit = INTERP_LIMITS.get(_GROUP_REPR_COL_FOR_LIMIT[g])
+            for suffix in (_CARRY_ANY, _CARRY_ALL):
+                c = f'{g}{suffix}'
+                if c not in prop.columns:
+                    continue
+                s = prop[c]
+                inherited = bracketing_or_fill(s, limit)
+                # Only overwrite the propagation-gap cells (NaN carriers);
+                # leave the regridded 0.0/1.0 values untouched.
+                prop[c] = s.where(s.notna(), inherited.astype(float))
 
         # Build the per-group boundary flags.
         b_flags = {}
         for g in _FLAG_GROUPS:
             c_any = f'{g}{_CARRY_ANY}'
             c_all = f'{g}{_CARRY_ALL}'
-            # Binarize the smeared carriers:
+            # Binarize the carriers (regridding blends <=2 parent rows, and
+            # propagation gaps now carry the inherited worse-of-two level):
             #   any: any positive fraction means a flagged parent row
             #        contributed (conservative toward "interpolated").
             #   all: only an exact 1.0 blend means every contributing parent
@@ -662,18 +691,11 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
                 all_f = pd.Series(False, index=prop.index)
             all_f = all_f & any_f   # 'all' cannot hold without 'any'
 
-            col = _GROUP_REPR_COL[g]
-            if g in pre_nan and col in prop.columns:
-                filled_now = pre_nan[g] & prop[col].notna()  # NaN -> finite
-            else:
-                filled_now = pd.Series(False, index=prop.index)
-
-            # Level: 0 all-direct, 1 mixed, 2 all-interpolated,
-            # 3 Stage-6 filled; blank handled later where the value is NaN.
+            # Level: 0 all-direct, 1 mixed, 2 all-interpolated; blank handled
+            # later where the value is NaN (gaps beyond the limit stay blank).
             flag = pd.Series(0, index=prop.index, dtype='int64')
             flag = flag.mask(any_f, 1)
             flag = flag.mask(all_f, 2)
-            flag = flag.mask(filled_now, 3)
             b_flags[g] = flag
 
         # Drop the internal carrier columns from the numeric output.

@@ -8,6 +8,8 @@ from midl_pipeline.l1_filters import (
     interpolate_with_limits,
     median_filter_3,
     smooth_transitions,
+    drop_isolated_minutes,
+    bracketing_or_fill,
     _jump_magnitude,
 )
 from helpers import _synthetic_sat_df, _synthetic_sat_df_with_gap, _synthetic_sat_df_with_spike
@@ -252,3 +254,99 @@ class TestSmoothTransitions:
         original = df["Ux"].copy()
         smooth_transitions(df, source_changed=None)
         pd.testing.assert_series_equal(df["Ux"], original)
+
+
+# ---------------------------------------------------------------------------
+# drop_isolated_minutes
+# ---------------------------------------------------------------------------
+
+def _minute_index(n, start="2024-01-01"):
+    return pd.date_range(start=start, periods=n, freq="1min")
+
+
+class TestDropIsolatedMinutes:
+    def test_lone_minute_dropped_run_kept(self):
+        idx = _minute_index(6)
+        # [F, T, F, T, T, F] -> lone T at 1 dropped; T-T run at 3,4 kept.
+        mask = pd.Series([False, True, False, True, True, False], index=idx)
+        out = drop_isolated_minutes(mask)
+        expected = pd.Series([False, False, False, True, True, False], index=idx)
+        pd.testing.assert_series_equal(out, expected)
+
+    def test_boundary_lone_minutes_dropped(self):
+        idx = _minute_index(4)
+        # True at first and last position, both isolated -> dropped.
+        mask = pd.Series([True, False, False, True], index=idx)
+        out = drop_isolated_minutes(mask)
+        assert not out.any()
+
+    def test_gap_separated_trues_are_isolated(self):
+        # Two True cells adjacent in POSITION but two minutes apart in TIME.
+        idx = pd.DatetimeIndex(["2024-01-01 00:00", "2024-01-01 00:02"])
+        mask = pd.Series([True, True], index=idx)
+        out = drop_isolated_minutes(mask)
+        assert not out.any()  # neither has a 1-minute True neighbor
+
+    def test_adjacent_pair_kept(self):
+        idx = _minute_index(3)
+        mask = pd.Series([False, True, True], index=idx)
+        out = drop_isolated_minutes(mask)
+        pd.testing.assert_series_equal(out, mask)
+
+    def test_three_in_a_row_all_kept(self):
+        idx = _minute_index(5)
+        mask = pd.Series([False, True, True, True, False], index=idx)
+        out = drop_isolated_minutes(mask)
+        pd.testing.assert_series_equal(out, mask)
+
+    def test_all_false_unchanged(self):
+        idx = _minute_index(5)
+        mask = pd.Series(False, index=idx)
+        out = drop_isolated_minutes(mask)
+        assert not out.any()
+
+    def test_empty_returned(self):
+        mask = pd.Series([], dtype=bool, index=pd.DatetimeIndex([]))
+        out = drop_isolated_minutes(mask)
+        assert len(out) == 0
+
+    def test_does_not_mutate_input(self):
+        idx = _minute_index(3)
+        mask = pd.Series([False, True, False], index=idx)
+        original = mask.copy()
+        drop_isolated_minutes(mask)
+        pd.testing.assert_series_equal(mask, original)
+
+
+# ---------------------------------------------------------------------------
+# bracketing_or_fill (propagation-gap provenance inheritance)
+# ---------------------------------------------------------------------------
+
+class TestBracketingOrFill:
+    def test_gap_between_two_false_stays_false(self):
+        idx = _minute_index(5)
+        s = pd.Series([0.0, np.nan, np.nan, np.nan, 0.0], index=idx)
+        out = bracketing_or_fill(s, limit=60)
+        assert not out.iloc[1:4].any()  # gap between two direct minutes -> direct
+
+    def test_gap_inherits_true_from_either_side(self):
+        idx = _minute_index(5)
+        # left direct (0), right interpolated (1) -> gap inherits the worse (True).
+        s = pd.Series([0.0, np.nan, np.nan, np.nan, 1.0], index=idx)
+        out = bracketing_or_fill(s, limit=60)
+        assert out.iloc[1] and out.iloc[2] and out.iloc[3]
+
+    def test_gap_true_both_sides(self):
+        idx = _minute_index(4)
+        s = pd.Series([1.0, np.nan, np.nan, 1.0], index=idx)
+        out = bracketing_or_fill(s, limit=60)
+        assert out.iloc[1] and out.iloc[2]
+
+    def test_beyond_limit_is_false(self):
+        idx = _minute_index(6)
+        s = pd.Series([1.0, np.nan, np.nan, np.nan, np.nan, 1.0], index=idx)
+        out = bracketing_or_fill(s, limit=1)
+        assert out.iloc[1]        # one step after the left endpoint
+        assert out.iloc[4]        # one step before the right endpoint
+        assert not out.iloc[2]    # two-plus steps from either endpoint
+        assert not out.iloc[3]

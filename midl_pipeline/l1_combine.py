@@ -16,7 +16,7 @@ from itertools import combinations as _combinations
 import numpy as np
 import pandas as pd
 
-from .l1_filters import median_filter_3
+from .l1_filters import median_filter_3, drop_isolated_minutes
 from .l1_quality import score_all_plasma
 
 
@@ -399,7 +399,8 @@ def combine_temperature(data_map, master_grid, t_interp_flags=None,
             raw = data_map[sat]['T'].reindex(master_grid)
             s = raw.interpolate(method='time', limit=2, limit_area='inside')
             # Cells the 2-min pre-fill turned from NaN into finite values.
-            prefill = raw.isna() & s.notna()
+            # T is plasma: a single isolated minute fill is not flagged.
+            prefill = drop_isolated_minutes(raw.isna() & s.notna())
             # Upstream Stage-2 flag for this satellite's T, aligned here.
             upstream = (t_interp_flags.get(sat) if t_interp_flags else None)
             if upstream is not None:

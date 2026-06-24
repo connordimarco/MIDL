@@ -100,7 +100,7 @@ def _attach_interp_flags(df, flag_map):
     """Add integer `<group>_interp` columns to *df* from *flag_map*.
 
     flag_map : dict[group -> pd.Series of int]  (provenance levels:
-        0 all-direct, 1 mixed, 2 all-interpolated, 3 Stage-6 fill).
+        0 all-direct, 1 mixed, 2 all-interpolated).
     A flag cell is left blank (NaN) where the corresponding data value is
     missing, so provenance is only asserted where there is a value.
     """
