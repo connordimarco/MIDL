@@ -427,12 +427,18 @@ def download_day(day, cda, raw_dir='L1_raw'):
         'mag_time': 'Epoch',
         'mag_vars': {'BGSM': ['Bx', 'By', 'Bz']},
         'plasma_time': 'Epoch',
+        # Non-linear bi-Maxwellian fit (Proton_*_nonlin), not the SWE moments:
+        # it better isolates the proton core. The moment temperature is biased
+        # high (validated against ACE; >1e5 K in fast/transient wind) while
+        # velocity and density are nearly unchanged. Proton_W_nonlin is the
+        # scalar thermal speed sqrt((2*Wperp^2 + Wpar^2)/3), i.e. T=(2*Tperp+Tpar)/3.
+        # OMNI uses the same non-linear fit (King & Papitashvili, 2005).
         'plasma_vars': {
-            'Proton_VX_moment': ['Ux'],
-            'Proton_VY_moment': ['Uy'],
-            'Proton_VZ_moment': ['Uz'],
-            'Proton_Np_moment': ['rho'],
-            'Proton_W_moment': ['v_th'],
+            'Proton_VX_nonlin': ['Ux'],
+            'Proton_VY_nonlin': ['Uy'],
+            'Proton_VZ_nonlin': ['Uz'],
+            'Proton_Np_nonlin': ['rho'],
+            'Proton_W_nonlin': ['v_th'],
         },
     }
 

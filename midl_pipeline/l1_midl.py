@@ -751,6 +751,10 @@ def midl(start, end, raw_dir='L1_raw', boundaries_re=(14, 32),
                 crash_infos.append(info)
                 print(f'  MHD crash at attempt {attempt+1}, '
                       f'recovered {len(ds_seg.time)} minutes')
+                # Surface the actual BATSRUS failure (return code + stderr tail)
+                # so the cause is visible in the worker log, not just inferred.
+                print(f'  --- BATSRUS crash detail (attempt {attempt+1}) ---\n'
+                      f'{info}\n  --- end crash detail ---')
 
             if len(ds_seg.time) > 0:
                 segments.append(ds_seg)

@@ -50,6 +50,15 @@ _OPENMPI_PATH = os.environ.get('MIDL_OPENMPI_PATH', '/usr/lib64/openmpi/bin')
 _MPIRUN = os.environ.get('MIDL_MPIRUN', 'mpirun -np 1')
 _SPINUP = pd.Timedelta(hours=1)
 
+# Temperature floor [K] for the BATSRUS inflow boundary condition only. BATSRUS
+# becomes numerically unstable and writes degenerate plot files when the inflow
+# proton T drops into the ~8,000-10,000 K range (the combined inflow bottomed at
+# ~8,100 K and crashed; moment data never went below ~11,000 K and ran fine).
+# This is HIGHER than the science floor (_T_FLOOR=5,000 K in l1_combine.py) on
+# purpose: the L1/14Re/32Re science products keep their lower floor for fidelity,
+# while the MHD solver gets the headroom it needs for stability.
+_MHD_T_FLOOR = 1.0e4
+
 # IDL record layout: offsets into the 15-double cell record
 _IDL_COL_X  = 1
 _IDL_COL_RHO = 4
@@ -213,6 +222,11 @@ def _fill_for_mhd(df):
             filled[col] = filled[col].fillna(default)
 
     df[_NUMERIC_COLS] = filled
+
+    # Floor the proton T for the MHD inflow only (see _MHD_T_FLOOR). The science
+    # products are written separately from their own (lower) floor; this clip
+    # keeps BATSRUS out of its low-pressure instability regime.
+    df['T'] = df['T'].clip(lower=_MHD_T_FLOOR)
     return df
 
 
@@ -367,16 +381,32 @@ def _run_batsrus(batsrus_exe, run_dir, timeout=None):
     # SLURM allocation without a PMI-aware launcher (MPI_Init_thread fails
     # on "NULL communicator"). `-np 1` is a single-rank BATSRUS 1D run.
     cmd = f'ulimit -s unlimited && {_MPIRUN} ./BATSRUS.exe'
+
+    def _dump(rc, out_b, err_b):
+        """Persist the full BATSRUS output next to the run for diagnosis."""
+        try:
+            with open(os.path.join(run_dir, 'batsrus_crash.log'), 'w') as f:
+                f.write(f'returncode={rc}\n=== STDOUT ===\n'
+                        f'{(out_b or b"").decode(errors="replace")}\n'
+                        f'=== STDERR ===\n'
+                        f'{(err_b or b"").decode(errors="replace")}\n')
+        except Exception:
+            pass
+
     try:
         subprocess.run(
             cmd, cwd=run_dir, env=env, shell=True, check=True,
             capture_output=True, timeout=timeout)
     except subprocess.CalledProcessError as e:
+        _dump(e.returncode, e.stdout, e.stderr)
         tail_out = (e.stdout or b'').decode(errors='replace')[-2000:]
         tail_err = (e.stderr or b'').decode(errors='replace')[-2000:]
         raise RuntimeError(
             f'BATSRUS.exe failed in {run_dir} (rc={e.returncode}):\n'
             f'STDOUT tail:\n{tail_out}\nSTDERR tail:\n{tail_err}')
+    except subprocess.TimeoutExpired as e:
+        _dump('TIMEOUT', e.stdout, e.stderr)
+        raise RuntimeError(f'BATSRUS.exe timed out in {run_dir}')
 
 
 # ---------------------------------------------------------------------------
@@ -405,28 +435,38 @@ def _parse_plot_files(run_dir, sim_start):
         raise RuntimeError(
             f'No BATSRUS plot files found in {io2}.  Run likely failed.')
 
-    # Read the first file to get the x grid.
-    first = _read_idl_record_file(idl_files[0])
-    x_re = first['x']
+    # Read every snapshot, skipping any that fail to parse.  When BATSRUS is
+    # killed mid-write (e.g. memory pressure under concurrent runs) the final
+    # file is truncated; the caller's restart loop then resumes from the last
+    # good snapshot, so a bad file must be skipped, not fatal.
+    snaps, runtimes_l = [], []
+    n_skipped = 0
+    for path in idl_files:
+        try:
+            snap = _read_idl_record_file(path)
+            rt = _read_runtime_from_header(path)
+        except (ValueError, struct.error, OSError, IndexError) as e:
+            n_skipped += 1
+            print(f'  Skipping unreadable IDL snapshot {os.path.basename(path)}: {e}')
+            continue
+        snaps.append(snap)
+        runtimes_l.append(rt)
+
+    if not snaps:
+        raise RuntimeError(
+            f'No parseable BATSRUS plot files in {io2} '
+            f'({len(idl_files)} present, all unreadable).')
+    if n_skipped:
+        print(f'  Parsed {len(snaps)} snapshots, skipped {n_skipped} truncated/unreadable.')
+
+    x_re = snaps[0]['x']
     n_x = len(x_re)
+    n_t = len(snaps)
+    data = {k: np.empty((n_t, n_x), dtype=np.float32)
+            for k in ('Bx', 'By', 'Bz', 'Ux', 'Uy', 'Uz', 'rho', 'T')}
+    runtimes = np.asarray(runtimes_l, dtype=np.float64)
 
-    n_t = len(idl_files)
-    data = {
-        'Bx':  np.empty((n_t, n_x), dtype=np.float32),
-        'By':  np.empty((n_t, n_x), dtype=np.float32),
-        'Bz':  np.empty((n_t, n_x), dtype=np.float32),
-        'Ux':  np.empty((n_t, n_x), dtype=np.float32),
-        'Uy':  np.empty((n_t, n_x), dtype=np.float32),
-        'Uz':  np.empty((n_t, n_x), dtype=np.float32),
-        'rho': np.empty((n_t, n_x), dtype=np.float32),
-        'T':   np.empty((n_t, n_x), dtype=np.float32),
-    }
-    runtimes = np.empty(n_t, dtype=np.float64)
-
-    for i, path in enumerate(idl_files):
-        snap = _read_idl_record_file(path)
-        runtimes[i] = _read_runtime_from_header(path)
-
+    for i, snap in enumerate(snaps):
         rho = snap['Rho']
         p   = snap['P']
         # T[K] = P[Pa] / (n[m^-3] * kB).  rho is amu/cc ≈ proton/cc for
@@ -506,6 +546,13 @@ def _read_idl_record_file(path):
         pos += 4 + reclen + 4
 
     arr = np.asarray(rows, dtype=np.float64)  # shape (n_cells, 15)
+    # A file truncated mid-write (e.g. BATSRUS killed under memory pressure)
+    # yields zero/partial records, so arr is not the expected (n_cells, 15).
+    # Raise a clean error the parser can catch and skip.
+    if arr.ndim != 2 or arr.shape[1] != _IDL_NDOUBLE or arr.shape[0] == 0:
+        raise ValueError(
+            f'Truncated or malformed IDL file {path}: parsed array shape '
+            f'{arr.shape}, expected (n_cells, {_IDL_NDOUBLE}).')
     return {
         'x':   arr[:, _IDL_COL_X],
         'Rho': arr[:, _IDL_COL_RHO],

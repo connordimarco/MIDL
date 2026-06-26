@@ -350,6 +350,17 @@ def combine_data_priority(data_map, master_grid):
 _T_SPIKY_LOG_STD = 0.5
 _T_SPIKY_WINDOW = 11
 
+# Science floor for the proton temperature [K]. A small fraction of WIND SWE
+# non-linear fits return unphysically low T (down to ~400 K). Genuine cold slow
+# wind / ICME interiors extend below 10,000 K, so the science floor is set at
+# 5,000 K -- low enough to keep real cold-wind values, high enough to reject the
+# clear fit-failure garbage (which concentrates below ~2,000-5,000 K, at fast
+# wind where such low T is non-physical). Applied per satellite before the merge.
+# NOTE: the BATSRUS MHD inflow needs a HIGHER floor (~10,000 K) for numerical
+# stability and applies its own (see _MHD_T_FLOOR in l1_mhd.py); these are
+# deliberately separate -- science fidelity vs. solver stability.
+_T_FLOOR = 5.0e3
+
 
 def combine_temperature(data_map, master_grid, t_interp_flags=None,
                         return_flag=False):
@@ -415,6 +426,11 @@ def combine_temperature(data_map, master_grid, t_interp_flags=None,
                 .std()
             )
             s = s.where(log_std <= _T_SPIKY_LOG_STD, other=np.nan)
+            # Floor the proton temperature at the physical solar-wind limit
+            # (see _T_FLOOR). Clipping per-satellite here keeps the floor on
+            # Wind-only minutes and the cross-satellite log-median otherwise
+            # (NaN is preserved by clip).
+            s = s.clip(lower=_T_FLOOR)
             sat_T[sat] = s
         else:
             sat_T[sat] = pd.Series(np.nan, index=master_grid)
