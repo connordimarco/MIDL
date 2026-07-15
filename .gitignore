@@ -18,3 +18,8 @@ dist/
 build/
 .DS_Store
 .vscode/
+# Realtime tier (MIDL-RT): deliberately unversioned in this public repo
+midl_realtime/
+tests/rt_helpers.py
+tests/test_realtime_*.py
+tests/fixtures/rtsw/

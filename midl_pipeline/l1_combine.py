@@ -20,11 +20,11 @@ from .l1_filters import median_filter_3, drop_isolated_minutes
 from .l1_quality import score_all_plasma
 
 
-SAT_CODE = {'ace': 1, 'dscovr': 2, 'wind': 3, 'solar1': 4}
-# Code 5 reserved for IMAP (pending data availability).
-# To add IMAP when data is available:
+SAT_CODE = {'ace': 1, 'dscovr': 2, 'wind': 3, 'solar1': 4, 'imap': 5}
+# IMAP (code 5) participates in the realtime tier only (midl_realtime feeds an
+# 'imap' data_map key built from the SWPC RTSW stream). The batch pipeline never
+# loads IMAP — the steps below remain TODO for the archival product:
 #   1. pip install imap-data-access
-#   2. Add 'imap': 5 to SAT_CODE
 #   3. Add download function in l1_downloaders.py (query api.imap-mission.com for
 #      instrument=mag, data_level=l2; download CDF; read b_gsm variable)
 #   4. Add process function in l1_pipeline.py

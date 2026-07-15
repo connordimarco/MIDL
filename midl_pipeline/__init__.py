@@ -21,19 +21,34 @@ plot_variable(result, var, day_str, output_dir)
     Plot a single variable for one day.
 """
 
-from .l1_midl import midl, MIDLResult
-from .l1_writers import write_monthly_outputs
-from .l1_plot import plot_day, plot_variable, plot_day_from_csv
-from .l1_pipeline import download_day
-from .l1_mhd import mhd_propagation
+# Public API is resolved lazily (PEP 562): the submodules behind it pull in
+# heavy third-party stacks (l1_plot -> matplotlib, l1_pipeline -> spacepy +
+# pyspedas, l1_mhd -> xarray) that lightweight importers — notably the
+# per-minute midl_realtime tick — must not pay for.
+_LAZY_API = {
+    'midl': 'l1_midl',
+    'MIDLResult': 'l1_midl',
+    'write_monthly_outputs': 'l1_writers',
+    'plot_day': 'l1_plot',
+    'plot_variable': 'l1_plot',
+    'plot_day_from_csv': 'l1_plot',
+    'download_day': 'l1_pipeline',
+    'mhd_propagation': 'l1_mhd',
+}
 
-__all__ = [
-    'midl',
-    'MIDLResult',
-    'write_monthly_outputs',
-    'plot_day',
-    'plot_variable',
-    'plot_day_from_csv',
-    'download_day',
-    'mhd_propagation',
-]
+__all__ = list(_LAZY_API)
+
+
+def __getattr__(name):
+    try:
+        submodule = _LAZY_API[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+    value = getattr(import_module(f'.{submodule}', __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_API))

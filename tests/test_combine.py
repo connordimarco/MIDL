@@ -82,7 +82,9 @@ class TestSelectColumnWithContinuity:
         idx = pd.date_range("2024-05-01", periods=n, freq="min")
         defaults = {"ace": -400.0, "dscovr": -400.0, "wind": -400.0, "solar1": np.nan}
         defaults.update(overrides)
-        return {name: pd.Series(defaults[name], index=idx) for name in SAT_CODE}
+        # Satellites in SAT_CODE but not in defaults (e.g. imap) count as absent.
+        return {name: pd.Series(defaults.get(name, np.nan), index=idx)
+                for name in SAT_CODE}
 
     def test_single_sat_passthrough(self):
         ss = self._make_sat_series(dscovr=np.nan, wind=np.nan, solar1=np.nan)
@@ -113,18 +115,13 @@ class TestSelectColumnWithContinuity:
                 assert len(s) == 1
 
     def test_hysteresis_3min(self):
-        idx = pd.date_range("2024-05-01", periods=60, freq="min")
         ace_vals = np.full(60, 0.0)
         dscovr_vals = np.full(60, 50.0)
         wind_vals = np.full(60, 100.0)
         wind_vals[30] = 0.5
         wind_vals[31] = 0.5
-        ss = {
-            "ace": pd.Series(ace_vals, index=idx),
-            "dscovr": pd.Series(dscovr_vals, index=idx),
-            "wind": pd.Series(wind_vals, index=idx),
-            "solar1": pd.Series(np.nan, index=idx),
-        }
+        ss = self._make_sat_series(
+            ace=ace_vals, dscovr=dscovr_vals, wind=wind_vals)
         vals, _, source = _select_column_with_continuity("|B|", ss)
         sources_29_32 = [source.iloc[i] for i in range(29, 33)]
         assert all(s is not None for s in sources_29_32)
