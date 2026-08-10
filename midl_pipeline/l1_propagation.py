@@ -20,7 +20,8 @@ import pandas as pd
 VX_COL = 'Vx Velocity, km/s, GSE'
 
 
-def ballistic_propagation(orbit, raw_data, target_x_km=90000):
+def ballistic_propagation(orbit, raw_data, target_x_km=90000,
+                          extend_minutes=0):
     """Propagate L1 observations to a target X position along the Sun-Earth line.
 
     Parameters
@@ -33,15 +34,22 @@ def ballistic_propagation(orbit, raw_data, target_x_km=90000):
     target_x_km : float
         Target boundary X position in km (positive Sunward, e.g.
         14*6371 ≈ 89 194 km for 14 Re).
+    extend_minutes : int
+        Extend the output grid this many minutes past the last input
+        time.  The ballistic shift moves the newest measurements 30-90
+        minutes into the future (the L1 transit lead); with the default
+        0 those arrivals are clipped at the input's end — correct for
+        historical reprocessing, but the realtime IMF views pass >0 to
+        keep the lead.  Grid minutes beyond the last arrival stay NaN.
 
     Returns
     -------
     pd.DataFrame
-        Propagated data on a complete 1-minute grid matching the input
-        time range.  Arrival times are computed exactly (no rounding),
-        then interpolated onto the regular grid so no minutes are dropped.
-        Variables with real data gaps remain NaN; only the timing
-        calculation uses gap-filled Ux.
+        Propagated data on a complete 1-minute grid over the input time
+        range (plus extend_minutes).  Arrival times are computed exactly
+        (no rounding), then interpolated onto the regular grid so no
+        minutes are dropped.  Variables with real data gaps remain NaN;
+        only the timing calculation uses gap-filled Ux.
     """
     input_df = raw_data.copy()
     x_gse = np.float64(orbit['X_GSE'].item())
@@ -82,7 +90,10 @@ def ballistic_propagation(orbit, raw_data, target_x_km=90000):
     input_df = input_df[~input_df.index.duplicated(keep='first')]
     input_df = input_df.sort_index()
 
-    grid = pd.date_range(raw_data.index.min(), raw_data.index.max(), freq='min')
+    grid = pd.date_range(
+        raw_data.index.min(),
+        raw_data.index.max() + pd.Timedelta(minutes=extend_minutes),
+        freq='min')
     combined = input_df.index.union(grid)
     result = input_df.reindex(combined).interpolate(
         method='index', limit=2).reindex(grid)

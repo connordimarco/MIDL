@@ -403,17 +403,24 @@ def _build_stage2_flags(data_map, source_map, master_grid):
     return group_flags
 
 
-def _propagate_to_boundary(df_combined, ref_x_daily, target_km):
+def _propagate_to_boundary(df_combined, ref_x_daily, target_km,
+                           lead_minutes=0):
     """Propagate combined data to a fixed boundary using per-day reference X.
 
     Each day is propagated with a 3-hour pad from the previous day so that
     the ballistic time-shift doesn't leave NaN gaps at the start of each day.
+
+    lead_minutes > 0 keeps the ballistic transit lead past the final input
+    time (rows whose arrival falls after the last measurement) instead of
+    clipping there.  The default 0 preserves the historical/monthly
+    behavior exactly; the realtime IMF views opt in.
     """
     _PAD = pd.Timedelta(hours=3)
     all_dates = sorted(set(df_combined.index.date))
     frames = []
 
     for date in all_dates:
+        is_last_day = (date == all_dates[-1])
         x_ref = ref_x_daily.get(date, 1.5e6)
         day_start = pd.Timestamp(date)
         day_end = day_start + pd.Timedelta(days=1)
@@ -434,14 +441,17 @@ def _propagate_to_boundary(df_combined, ref_x_daily, target_km):
             columns={'Ux': 'Vx Velocity, km/s, GSE'})
         orbit = pd.Series({'X_GSE': x_ref})
         df_prop = ballistic_propagation(
-            orbit, df_padded, target_x_km=target_km)
+            orbit, df_padded, target_x_km=target_km,
+            extend_minutes=lead_minutes if is_last_day else 0)
         df_prop = df_prop.rename(
             columns={'Vx Velocity, km/s, GSE': 'Ux'})
 
-        # Slice back to just the target day.
-        day_mask = ((df_prop.index >= day_start) &
-                    (df_prop.index < day_end))
-        frames.append(df_prop.loc[day_mask])
+        # Slice back to just the target day — except the last day with a
+        # lead, whose extension may run past midnight and must be kept.
+        upper = df_prop.index < day_end
+        if is_last_day and lead_minutes:
+            upper = df_prop.index.notna()
+        frames.append(df_prop.loc[(df_prop.index >= day_start) & upper])
 
     if not frames:
         return df_combined.copy()
