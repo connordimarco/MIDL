@@ -5,8 +5,14 @@ Download helpers for raw L1 data files.
 
 Three sources are supported:
   - CDAWeb  (ACE, WIND, DSCOVR orbit) via the pyspedas CDAWeb client.
-  - NOAA NGDC (DSCOVR 1-min plasma + mag) via direct HTTP requests.
+  - NOAA archive S3 bucket (DSCOVR 1-min plasma + mag) via direct HTTP
+    requests. (Until ~2026-02 this lived at www.ngdc.noaa.gov/dscovr/data/,
+    which now redirects to a JS bucket explorer.)
   - NOAA NCEI HAPI (SOLAR-1 mag + orbit) via REST CSV downloads.
+
+Also provides the upstream-availability helpers (cdaweb_available_days,
+dscovr_available_days, hapi_coverage) used by the gapfill script to skip
+day-fetches for data that does not exist upstream.
 
 Files are written to local scratch directories inside cdf_temp/ and are
 expected to be cleaned up by the calling pipeline after processing.
@@ -23,6 +29,125 @@ _HAPI_BASE = (
     'https://www.ncei.noaa.gov/cloud-access/space-weather-portal'
     '/api/v1/hapi/data'
 )
+_HAPI_INFO_BASE = (
+    'https://www.ncei.noaa.gov/cloud-access/space-weather-portal'
+    '/api/v1/hapi/info'
+)
+
+# NOAA archive bucket holding the DSCOVR 1-min products (formerly NGDC).
+_NOAA_ARCHIVE_BASE = 'https://archive.data.noaa.gov/satellite-spaceweather'
+_DSCOVR_PRODUCT_PREFIX = {
+    'f1m': 'DSCOVR/DSCOVR/FC/f1m',
+    'm1m': 'DSCOVR/DSCOVR/MAG/m1m',
+}
+# Month-listing cache: {S3 prefix -> list of keys}. Per-process, so repeated
+# same-month day downloads cost one listing request instead of one per day.
+_dscovr_listing_cache = {}
+
+
+def _parse_s3_keys(xml_text):
+    """(keys, continuation_token) from an S3 ListObjectsV2 XML response."""
+    keys = re.findall(r'<Key>([^<]+)</Key>', xml_text)
+    m = re.search(r'<NextContinuationToken>([^<]+)</NextContinuationToken>',
+                  xml_text)
+    return keys, (m.group(1) if m else None)
+
+
+def noaa_archive_list(prefix, timeout=60):
+    """List all object keys under `prefix` in the NOAA archive bucket.
+
+    Raises RuntimeError if the listing cannot be fetched.
+    """
+    keys = []
+    token = None
+    while True:
+        params = {'list-type': '2', 'prefix': prefix, 'max-keys': '1000'}
+        if token:
+            params['continuation-token'] = token
+        try:
+            resp = requests.get(_NOAA_ARCHIVE_BASE, params=params,
+                                timeout=timeout)
+            resp.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(
+                f'Failed to list NOAA archive prefix {prefix}: {e}') from e
+        page_keys, token = _parse_s3_keys(resp.text)
+        keys.extend(page_keys)
+        if not token:
+            return keys
+
+
+# ---------------------------------------------------------------------------
+# Upstream availability (used by the gapfill script to prune futile fetches)
+# ---------------------------------------------------------------------------
+
+_CDAWEB_DATA_BASE = 'https://cdaweb.gsfc.nasa.gov/sp_phys/data'
+
+
+def cdaweb_available_days(dataset_dir, years, timeout=60):
+    """Days ('YYYY-MM-DD') with a file in a CDAWeb dataset directory.
+
+    One listing request per year. `dataset_dir` is the path below sp_phys/data,
+    e.g. 'ace/mag/level_2_cdaweb/mfi_h0'. Returns None on any fetch error so
+    the caller can fail open (attempt the download rather than skip it).
+    """
+    days = set()
+    for year in years:
+        url = f'{_CDAWEB_DATA_BASE}/{dataset_dir}/{year}/'
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code == 404:
+                continue          # year directory not created yet -> no days
+            resp.raise_for_status()
+        except Exception as e:
+            print(f'  WARNING: could not list {url}: {e}')
+            return None
+        for d in re.findall(r'_(\d{8})_v\d+\.cdf', resp.text):
+            days.add(f'{d[:4]}-{d[4:6]}-{d[6:]}')
+    return days
+
+
+def dscovr_available_days(product, months):
+    """Days ('YYYY-MM-DD') with a DSCOVR file for `product` ('f1m'/'m1m').
+
+    One bucket listing per month in `months` (iterable of 'YYYY-MM').
+    Listings are cached, so the subsequent per-day downloads reuse them.
+    Returns None on any fetch error (caller fails open).
+    """
+    days = set()
+    pattern = re.compile(
+        rf'oe_{re.escape(product)}_dscovr_s(\d{{8}})\d+_e\d+_p\d+_pub\.nc\.gz$')
+    for month in months:
+        y, m = month.split('-')
+        prefix = f'{_DSCOVR_PRODUCT_PREFIX[product]}/{y}/{m}/'
+        try:
+            if prefix not in _dscovr_listing_cache:
+                _dscovr_listing_cache[prefix] = noaa_archive_list(prefix)
+        except RuntimeError as e:
+            print(f'  WARNING: {e}')
+            return None
+        for key in _dscovr_listing_cache[prefix]:
+            match = pattern.search(key)
+            if match:
+                d = match.group(1)
+                days.add(f'{d[:4]}-{d[4:6]}-{d[6:]}')
+    return days
+
+
+def hapi_coverage(dataset, timeout=60):
+    """(startDate, stopDate) as 'YYYY-MM-DD' strings from a HAPI info request.
+
+    Returns None on any error (caller fails open).
+    """
+    try:
+        resp = requests.get(_HAPI_INFO_BASE, params={'dataset': dataset},
+                            timeout=timeout)
+        resp.raise_for_status()
+        info = resp.json()
+        return info['startDate'][:10], info['stopDate'][:10]
+    except Exception as e:
+        print(f'  WARNING: HAPI info for {dataset} failed: {e}')
+        return None
 
 
 def download_cdaweb_files(cda, datasets, trange_start, trange_end, data_dir,
@@ -123,17 +248,20 @@ def download_position_cdaweb_files(cda, day, data_dir,
 
 
 def download_dscovr_ngdc(day, data_dir, products=('f1m', 'm1m')):
-    """Download DSCOVR 1-minute products from the NOAA NGDC portal.
+    """Download DSCOVR 1-minute products from the NOAA archive bucket.
 
-    Fetches gzipped NetCDF files matching the given date from
-    https://www.ngdc.noaa.gov/dscovr/data/YYYY/MM/.
+    The NGDC portal (www.ngdc.noaa.gov/dscovr/data/YYYY/MM/) went away in
+    early 2026; the files now live in the NOAA archive S3 bucket under
+    DSCOVR/DSCOVR/{FC/f1m,MAG/m1m}/YYYY/MM/ with unchanged filenames.
+    Month listings are cached per process, so re-downloading a run of days
+    in the same month costs one listing request total.
 
     Parameters
     ----------
     day : str  ('YYYY-MM-DD')
     data_dir : str
     products : tuple[str]
-        NGDC product codes to fetch.  Defaults: 'f1m' (plasma), 'm1m' (mag).
+        Product codes to fetch.  Defaults: 'f1m' (plasma), 'm1m' (mag).
 
     Returns
     -------
@@ -143,35 +271,30 @@ def download_dscovr_ngdc(day, data_dir, products=('f1m', 'm1m')):
     Raises
     ------
     RuntimeError
-        If the NGDC monthly directory listing cannot be fetched.
+        If a bucket listing cannot be fetched.
     """
-    # Build date-specific directory/filename pieces once.
     dt = datetime.strptime(day, '%Y-%m-%d')
     date_str = dt.strftime('%Y%m%d')
-    base_url = f"https://www.ngdc.noaa.gov/dscovr/data/{dt.year}/{dt.month:02d}/"
 
     os.makedirs(data_dir, exist_ok=True)
 
-    # Grab the monthly index page and search for matching product files.
-    try:
-        resp = requests.get(base_url, timeout=30)
-        resp.raise_for_status()
-        listing = resp.text
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to fetch NGDC directory {base_url}: {e}") from e
-
     paths = {}
     for product in products:
-        # NGDC filenames include run-specific tags, so we match by regex.
-        pattern = rf'oe_{re.escape(product)}_dscovr_s{date_str}\d+_e{date_str}\d+_p\d+_pub\.nc\.gz'
-        match = re.search(pattern, listing)
-        if not match:
+        prefix = f'{_DSCOVR_PRODUCT_PREFIX[product]}/{dt.year}/{dt.month:02d}/'
+        if prefix not in _dscovr_listing_cache:
+            _dscovr_listing_cache[prefix] = noaa_archive_list(prefix)
+
+        # Filenames include run-specific tags, so we match by regex.
+        pattern = re.compile(
+            rf'oe_{re.escape(product)}_dscovr_s{date_str}\d+'
+            rf'_e{date_str}\d+_p\d+_pub\.nc\.gz$')
+        key = next((k for k in _dscovr_listing_cache[prefix]
+                    if pattern.search(k)), None)
+        if key is None:
             print(f"  WARNING: No NGDC {product} file found for {day}.")
             continue
 
-        filename = match.group(0)
-        file_url = base_url + filename
+        file_url = f'{_NOAA_ARCHIVE_BASE}/{key}'
         local_path = os.path.join(
             data_dir, f"dscovr_{product}_{date_str}.nc.gz")
 
@@ -183,7 +306,7 @@ def download_dscovr_ngdc(day, data_dir, products=('f1m', 'm1m')):
                 for chunk in r.iter_content(chunk_size=1 << 16):
                     f.write(chunk)
             paths[product] = local_path
-            print(f"  Downloaded {filename} -> {local_path}")
+            print(f"  Downloaded {os.path.basename(key)} -> {local_path}")
         except Exception as e:
             print(f"  WARNING: Failed to download {file_url}: {e}")
 

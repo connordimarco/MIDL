@@ -173,12 +173,20 @@ def nc_gz_to_df(nc_gz_path, time_var, data_vars):
 def hapi_csv_to_df(csv_path, col_map, fill_value=-9999):
     """Read a HAPI-format CSV file into a DataFrame.
 
+    Per the HAPI spec, CSV responses carry no header row; NCEI's server
+    included one until ~June 2026 and then stopped, so both forms are
+    accepted. A file whose first line starts with a parseable timestamp is
+    treated as headerless, with columns assigned from `col_map` in request
+    order (time column first).
+
     Parameters
     ----------
     csv_path : str
         Path to the CSV file downloaded from a HAPI endpoint.
     col_map : dict[str, str]
-        Mapping of HAPI parameter name -> output column name.
+        Mapping of HAPI parameter name -> output column name. For a
+        headerless file, the keys must be every parameter requested, in
+        request order.
     fill_value : float
         Value treated as missing data (replaced with NaN).
 
@@ -187,7 +195,27 @@ def hapi_csv_to_df(csv_path, col_map, fill_value=-9999):
     pd.DataFrame  (empty on error)
     """
     try:
-        df = pd.read_csv(csv_path, parse_dates=[0], index_col=0)
+        with open(csv_path) as f:
+            first_line = f.readline().strip()
+        if not first_line:
+            return pd.DataFrame()
+        first_fields = first_line.split(',')
+        try:
+            pd.to_datetime(first_fields[0])
+            has_header = False
+        except (ValueError, TypeError):
+            has_header = True
+        if has_header:
+            df = pd.read_csv(csv_path, parse_dates=[0], index_col=0)
+        else:
+            names = ['timestamp'] + list(col_map)
+            if len(first_fields) != len(names):
+                print(f'Error reading HAPI CSV {csv_path}: headerless file '
+                      f'has {len(first_fields)} columns, expected '
+                      f'{len(names)} (time + {len(col_map)} parameters)')
+                return pd.DataFrame()
+            df = pd.read_csv(csv_path, header=None, names=names,
+                             parse_dates=[0], index_col=0)
         df.index.name = 'timestamp'
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)

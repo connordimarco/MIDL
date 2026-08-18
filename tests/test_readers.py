@@ -122,6 +122,32 @@ class TestHapiCsvToDf:
         df = hapi_csv_to_df(str(path), {"old_name": "Bx"})
         assert "Bx" in df.columns
 
+    def test_headerless_csv(self, tmp_path):
+        # HAPI-spec CSV: no header row (NCEI dropped its header ~June 2026).
+        path = tmp_path / "test.csv"
+        path.write_text(
+            "2026-07-01T00:00:00.000Z,0.47,-14.6,9.83\n"
+            "2026-07-01T00:01:00.000Z,0.34,-14.7,9.39\n"
+        )
+        col_map = {"b_gsm_min_x": "Bx", "b_gsm_min_y": "By", "b_gsm_min_z": "Bz"}
+        df = hapi_csv_to_df(str(path), col_map)
+        assert len(df) == 2
+        assert list(df.columns) == ["Bx", "By", "Bz"]
+        assert df["Bx"].iloc[0] == 0.47
+
+    def test_headerless_csv_column_count_mismatch(self, tmp_path):
+        path = tmp_path / "test.csv"
+        path.write_text("2026-07-01T00:00:00.000Z,0.47,-14.6\n")
+        col_map = {"b_gsm_min_x": "Bx", "b_gsm_min_y": "By", "b_gsm_min_z": "Bz"}
+        df = hapi_csv_to_df(str(path), col_map)
+        assert df.empty
+
+    def test_fully_empty_file(self, tmp_path):
+        path = tmp_path / "test.csv"
+        path.write_text("")
+        df = hapi_csv_to_df(str(path), {"b_x": "Bx"})
+        assert df.empty
+
     def test_empty_csv(self, tmp_path):
         path = tmp_path / "test.csv"
         path.write_text("timestamp,val\n")

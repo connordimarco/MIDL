@@ -13,6 +13,7 @@ Public entry points:
 """
 import glob
 import os
+import traceback
 from datetime import datetime
 
 import numpy as np
@@ -350,8 +351,11 @@ def process_satellite_hapi(day, data_dir, trange_start, trange_end,
     for col in ('Ux', 'Uy', 'Uz', 'rho', 'T'):
         df_final[col] = np.nan
 
-    check_cols = [c for c in ('Bx', 'By', 'Bz') if c in df_final.columns]
-    if check_cols and df_final[check_cols].isna().all().all():
+    missing = [c for c in ('Bx', 'By', 'Bz') if c not in df_final.columns]
+    if missing:
+        print(f'  solar1: mag columns {missing} missing after parse '
+              '(unexpected HAPI CSV layout?), skipping.')
+    elif df_final[['Bx', 'By', 'Bz']].isna().all().all():
         print('  solar1: all mag data is NaN for this day, skipping.')
     else:
         dt_start = datetime.strptime(trange_start, '%Y-%m-%d')
@@ -375,7 +379,7 @@ def process_satellite_hapi(day, data_dir, trange_start, trange_end,
 _SENTINEL_NAME = '.download_complete'
 
 
-def download_day(day, cda, raw_dir='L1_raw'):
+def download_day(day, cda, raw_dir='L1_raw', data_dir='cdf_temp'):
     """Phase 1: download raw data for all satellites and write to raw_dir/.
 
     Checks for a sentinel file to skip entirely on re-runs.  Per-satellite
@@ -389,6 +393,10 @@ def download_day(day, cda, raw_dir='L1_raw'):
     raw_dir : str
         Root of the data directory tree. All files (per-satellite .dat
         and L1_satpos.dat) are written to raw_dir/YYYY/MM/DD/.
+    data_dir : str
+        Scratch directory for raw CDF/NC/CSV downloads. Concurrent callers
+        must pass distinct directories -- cleanup steps glob and delete
+        inside it, so sharing one across in-flight days is a race.
     """
     dt = datetime.strptime(day, '%Y-%m-%d')
     day_raw_dir = os.path.join(raw_dir, dt.strftime('%Y/%m/%d'))
@@ -400,7 +408,6 @@ def download_day(day, cda, raw_dir='L1_raw'):
 
     trange_start = day
     trange_end = (pd.to_datetime(day) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-    data_dir = 'cdf_temp'
 
     # Determine which satellites still need downloading.
     need_ace = not os.path.exists(os.path.join(day_raw_dir, 'L1_ace.dat'))
@@ -442,23 +449,35 @@ def download_day(day, cda, raw_dir='L1_raw'):
         },
     }
 
+    # One satellite's failure must not abort the day: files already written
+    # for the other satellites stay valid, and the next gap scan retries
+    # whichever satellite failed here.
+    def _guarded(label, fn, *fargs, **fkwargs):
+        try:
+            fn(*fargs, **fkwargs)
+        except Exception:
+            print(f'  ERROR: {label} processing failed for {day}; '
+                  'continuing with the rest of the day.')
+            traceback.print_exc()
+
     if need_ace:
-        process_satellite('ace', 'ac_h0_mfi', 'ac_h0_swe',
-                          ace_map, data_dir, trange_start, trange_end,
-                          raw_base=raw_dir)
+        _guarded('ace', process_satellite, 'ace', 'ac_h0_mfi', 'ac_h0_swe',
+                 ace_map, data_dir, trange_start, trange_end,
+                 raw_base=raw_dir)
     if need_dscovr:
-        process_satellite_ngdc(day, data_dir, trange_start, trange_end,
-                               raw_base=raw_dir)
+        _guarded('dscovr', process_satellite_ngdc, day, data_dir,
+                 trange_start, trange_end, raw_base=raw_dir)
     if need_wind:
-        process_satellite('wind', 'wi_h0_mfi', 'wi_h1_swe',
-                          win_map, data_dir, trange_start, trange_end,
-                          raw_base=raw_dir)
+        _guarded('wind', process_satellite, 'wind', 'wi_h0_mfi', 'wi_h1_swe',
+                 win_map, data_dir, trange_start, trange_end,
+                 raw_base=raw_dir)
     if need_solar1:
-        process_satellite_hapi(day, data_dir, trange_start, trange_end,
-                               raw_base=raw_dir)
+        _guarded('solar1', process_satellite_hapi, day, data_dir,
+                 trange_start, trange_end, raw_base=raw_dir)
 
     # Position file (always recreate -- cheap and needed by combine step).
-    create_position_file(day, cda, pos_dir=raw_dir)
+    _guarded('satpos', create_position_file, day, cda, pos_dir=raw_dir,
+             data_dir=data_dir)
 
     # Write sentinel so future runs skip this day entirely.
     os.makedirs(day_raw_dir, exist_ok=True)
@@ -467,7 +486,8 @@ def download_day(day, cda, raw_dir='L1_raw'):
     print(f'[download_day] {day}: done.')
 
 
-def create_position_file(day, cda, cleanup_cdfs=True, pos_dir='L1_raw'):
+def create_position_file(day, cda, cleanup_cdfs=True, pos_dir='L1_raw',
+                         data_dir='cdf_temp'):
     """Write L1_satpos.dat containing mean noon GSM positions for all satellites.
 
     Downloads a narrow 11:00-13:00 UT window of orbit data, averages the
@@ -484,7 +504,6 @@ def create_position_file(day, cda, cleanup_cdfs=True, pos_dir='L1_raw'):
 
     # Position output is one noon-time row per day.
     dt_day = pd.to_datetime(day)
-    data_dir = 'cdf_temp'
 
     # Bug 2 fix: purge stale position CDFs from any previous run so that
     # glob does not pick up wrong-day files left behind by a crash.
