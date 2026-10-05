@@ -3,15 +3,20 @@ l1_readers.py
 -------------
 Low-level file readers that convert raw L1 source files to DataFrames.
 
-Four entry points:
-  - cdf_to_df()      — NASA CDF files (ACE, WIND, DSCOVR orbit via CDAWeb).
-  - nc_gz_to_df()    — Gzipped NetCDF files (DSCOVR 1-min products from NGDC).
-  - hapi_csv_to_df() — HAPI CSV files (SOLAR-1 mag + orbit from NCEI).
-  - read_l1_data()   — Custom ASCII .dat files produced by this pipeline.
+Entry points:
+  - cdf_to_df()            — NASA CDF files (ACE, WIND, DSCOVR orbit via CDAWeb).
+  - nc_gz_to_df()          — Gzipped NetCDF files (DSCOVR 1-min products from NGDC).
+  - hapi_csv_to_df()       — HAPI CSV files (SOLAR-1 mag + orbit from NCEI).
+  - swips_l2_to_df()       — SOLAR-1 SWiPS L2 plasma (gzipped NetCDF).
+  - imap_mag_cdf_to_df()   — IMAP MAG L2 GSM (CDF, native ~2 Hz).
+  - imap_swapi_cdf_to_df() — IMAP SWAPI L3a proton moments (CDF, RTN).
+  - read_l1_data()         — Custom ASCII .dat files produced by this pipeline.
 
-All return a DataFrame indexed by a DatetimeIndex at 1-min cadence, or an
-empty DataFrame on failure.  Fill/valid-range masking is applied so callers
-receive NaN where the source file marks data as missing or out-of-range.
+All return a DataFrame indexed by a DatetimeIndex (1-min cadence except the
+SWiPS/IMAP readers, which return native cadence for the caller to resample),
+or an empty DataFrame on failure.  Fill/valid-range masking is applied so
+callers receive NaN where the source file marks data as missing or
+out-of-range.
 """
 import gzip
 import os
@@ -225,6 +230,132 @@ def hapi_csv_to_df(csv_path, col_map, fill_value=-9999):
     except Exception as e:
         print(f'Error reading HAPI CSV {csv_path}: {e}')
         return pd.DataFrame()
+
+
+# SWiPS times count microseconds since 1958-01-01 *including* leap seconds,
+# so a plain decode runs ahead of UTC by TAI-UTC (37 s since 2017-01-01; all
+# SWiPS data is later). Update if a leap second is ever added.
+_SWIPS_EPOCH = pd.Timestamp('1958-01-01')
+_SWIPS_TAI_MINUS_UTC = pd.Timedelta(seconds=37)
+
+
+def swips_l2_to_df(nc_gz_path):
+    """Read a SOLAR-1 SWiPS L2 file (gzipped NetCDF) into a DataFrame.
+
+    Returns proton moments per ~60 s sweep, indexed by sweep midpoint (UTC):
+    Ux/Uy/Uz (GSM, km/s), rho (cm^-3), T (K). The "_uncorr" moments are the
+    only populated ones (the "_corr" set is all fill as of 2026-10).
+
+    Screening follows the SWiPS provisional ReadMe (2026-06-09): the GPA
+    writes -9999.99 fills that the -9999 _FillValue does not mask, often with
+    zero density/temperature in the same sweep, and a sweep with one
+    implausible moment is unusable as a whole. So a whole sweep is dropped
+    when any moment is non-finite or out of range, or when its `flags`
+    (present from ~July 2026, undocumented) is nonzero.
+
+    Returns
+    -------
+    pd.DataFrame  (empty on error)
+    """
+    try:
+        with gzip.open(nc_gz_path, 'rb') as gz_f:
+            raw = gz_f.read()
+        ds = Dataset('inmemory', memory=raw)
+        ds.set_auto_mask(False)
+        mid_us = np.asarray(ds.variables['sweep_mid_time'][:], dtype=np.float64)
+        v = np.asarray(ds.variables['proton_v_uncorr_gsm'][:], dtype=np.float64)
+        n = np.asarray(ds.variables['proton_n_uncorr'][:], dtype=np.float64)
+        t = np.asarray(ds.variables['proton_t_uncorr'][:], dtype=np.float64)
+        flags = (np.asarray(ds.variables['flags'][:])
+                 if 'flags' in ds.variables else np.zeros(len(n), dtype=int))
+        ds.close()
+    except Exception as e:
+        print(f'Error reading SWiPS file {nc_gz_path}: {e}')
+        return pd.DataFrame()
+
+    times = (_SWIPS_EPOCH + pd.to_timedelta(mid_us, unit='us')
+             - _SWIPS_TAI_MINUS_UTC)
+    df = pd.DataFrame({'Ux': v[:, 0], 'Uy': v[:, 1], 'Uz': v[:, 2],
+                       'rho': n, 'T': t}, index=times)
+    df.index.name = 'timestamp'
+    good = (
+        (flags == 0)
+        & np.isfinite(df.values).all(axis=1)
+        & (df[['Ux', 'Uy', 'Uz']].abs() < 3000).all(axis=1)
+        & (df['rho'] > 0) & (df['rho'] < 200)
+        & (df['T'] > 0) & (df['T'] < 1e8)
+    )
+    return df[good]
+
+
+def imap_mag_cdf_to_df(cdf_path):
+    """Read an IMAP MAG L2 normal-rate GSM CDF: Bx/By/Bz (nT) at native
+    cadence (~2 Hz), with quality_flags != 0 and fills removed.
+
+    Returns
+    -------
+    pd.DataFrame  (empty on error)
+    """
+    try:
+        cdf = cdflib.CDF(cdf_path)
+        times = pd.to_datetime(cdflib.cdfepoch.to_datetime(cdf.varget('epoch')))
+        b = cdf.varget('b_gsm').astype(np.float64)
+        fillval = cdf.varattsget('b_gsm').get('FILLVAL')
+        quality = cdf.varget('quality_flags')
+    except Exception as e:
+        print(f'Error reading IMAP MAG CDF {cdf_path}: {e}')
+        return pd.DataFrame()
+    if fillval is not None:
+        b[b == float(np.atleast_1d(fillval)[0])] = np.nan
+    df = pd.DataFrame(b, index=times, columns=['Bx', 'By', 'Bz'])
+    df.index.name = 'timestamp'
+    return df[quality == 0]
+
+
+# SWAPI L3a swp_flags bits that make a record unusable: bit 2 (bad fit) and
+# bit 3 (fit failed). Bit 4 (preliminary MAG used for the field direction)
+# and bit 15 (predictive ephemeris) are cautions only.
+_SWAPI_BAD_FLAG_BITS = (1 << 2) | (1 << 3)
+
+
+def imap_swapi_cdf_to_df(cdf_path):
+    """Read an IMAP SWAPI L3a proton-sw CDF.
+
+    Returns proton moments per record (~1 min windows): VR/VT/VN (km/s, RTN,
+    Sun frame -- Earth's/IMAP's orbital motion removed, matching the
+    CDAWeb/OMNI/MIDL convention), rho (cm^-3), T (K). Fills, out-of-range
+    values and records with a bad/failed fit are dropped.
+
+    Returns
+    -------
+    pd.DataFrame  (empty on error)
+    """
+    try:
+        cdf = cdflib.CDF(cdf_path)
+        times = pd.to_datetime(cdflib.cdfepoch.to_datetime(cdf.varget('epoch')))
+        cols = {}
+        for var, names in (('proton_sw_velocity_rtn_sun', ['VR', 'VT', 'VN']),
+                           ('proton_sw_density', ['rho']),
+                           ('proton_sw_temperature', ['T'])):
+            val = cdf.varget(var).astype(np.float64)
+            atts = cdf.varattsget(var)
+            fillval = atts.get('FILLVAL')
+            if fillval is not None:
+                val[val == float(np.atleast_1d(fillval)[0])] = np.nan
+            if atts.get('VALIDMIN') is not None:
+                val[val < float(np.atleast_1d(atts['VALIDMIN'])[0])] = np.nan
+            if atts.get('VALIDMAX') is not None:
+                val[val > float(np.atleast_1d(atts['VALIDMAX'])[0])] = np.nan
+            val = val.reshape(len(times), -1)
+            for i, name in enumerate(names):
+                cols[name] = val[:, i]
+        flags = cdf.varget('swp_flags').astype(np.int64)
+    except Exception as e:
+        print(f'Error reading IMAP SWAPI CDF {cdf_path}: {e}')
+        return pd.DataFrame()
+    df = pd.DataFrame(cols, index=times)
+    df.index.name = 'timestamp'
+    return df[(flags & _SWAPI_BAD_FLAG_BITS) == 0]
 
 
 def read_l1_data(filepath):

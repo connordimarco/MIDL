@@ -24,11 +24,70 @@ from spacepy.time import Ticktock
 from .l1_downloaders import (
     download_cdaweb_files,
     download_dscovr_ngdc,
+    download_imap_day,
     download_position_cdaweb_files,
     download_solar1_hapi,
     download_solar1_position_hapi,
+    download_swips_l2,
+    sscweb_position_gsm,
 )
-from .l1_readers import cdf_to_df, hapi_csv_to_df, nc_gz_to_df
+from .l1_readers import (
+    cdf_to_df,
+    hapi_csv_to_df,
+    imap_mag_cdf_to_df,
+    imap_swapi_cdf_to_df,
+    nc_gz_to_df,
+    swips_l2_to_df,
+)
+
+
+def rtn_to_gse(times, v_rtn):
+    """Rotate RTN vectors measured near L1 into GSE.
+
+    R is taken as the Sun->Earth line (-X_GSE; the spacecraft's offset from
+    that line at L1 is < 0.5 deg). T is Omega x R / |Omega x R| with Omega the
+    Sun's spin axis (Carrington elements: inclination 7.25 deg to the
+    ecliptic, ascending node 73.6667 deg at 1850 + 0.013958 deg/yr), and
+    N = R x T. Ignoring the axis tilt would leak up to ~13% of the transverse
+    components into each other, so it is included.
+
+    Parameters
+    ----------
+    times : pd.DatetimeIndex
+    v_rtn : ndarray, shape (n, 3)
+
+    Returns
+    -------
+    ndarray, shape (n, 3)  -- GSE components
+    """
+    d = np.asarray((times - pd.Timestamp('2000-01-01T12:00:00'))
+                   / pd.Timedelta(days=1), dtype=np.float64)
+    # Sun's apparent ecliptic longitude (low-precision solar ephemeris).
+    mean_lon = np.radians(280.460 + 0.9856474 * d)
+    mean_anom = np.radians(357.528 + 0.9856003 * d)
+    lam = (mean_lon + np.radians(1.915) * np.sin(mean_anom)
+           + np.radians(0.020) * np.sin(2 * mean_anom))
+    # Sun's spin axis in ecliptic coordinates.
+    inc = np.radians(7.25)
+    node = np.radians(73.6667 + 0.013958 * (d + 2451545.0 - 2396758.5) / 365.25)
+    omega_ecl = np.stack([np.sin(inc) * np.sin(node),
+                          -np.sin(inc) * np.cos(node),
+                          np.full_like(node, np.cos(inc))], axis=-1)
+    # Express it on GSE axes: X = toward the Sun, Z = ecliptic north.
+    x_gse = np.stack([np.cos(lam), np.sin(lam), np.zeros_like(lam)], axis=-1)
+    y_gse = np.stack([-np.sin(lam), np.cos(lam), np.zeros_like(lam)], axis=-1)
+    omega = np.stack([(omega_ecl * x_gse).sum(-1),
+                      (omega_ecl * y_gse).sum(-1),
+                      omega_ecl[:, 2]], axis=-1)
+
+    r_hat = np.zeros_like(omega)
+    r_hat[:, 0] = -1.0
+    t_hat = np.cross(omega, r_hat)
+    t_hat /= np.linalg.norm(t_hat, axis=-1, keepdims=True)
+    n_hat = np.cross(r_hat, t_hat)
+    v_rtn = np.asarray(v_rtn, dtype=np.float64)
+    return (v_rtn[:, [0]] * r_hat + v_rtn[:, [1]] * t_hat
+            + v_rtn[:, [2]] * n_hat)
 
 
 def gse_to_gsm(df, cols):
@@ -314,49 +373,68 @@ _HAPI_MAG_COL_MAP = {
 
 def process_satellite_hapi(day, data_dir, trange_start, trange_end,
                            cleanup=True, raw_base='L1_raw'):
-    """Download-phase processing for SOLAR-1 using NCEI HAPI 1-minute MAG.
+    """Download-phase processing for SOLAR-1: NCEI HAPI 1-minute MAG plus
+    SWiPS L2 plasma from the NOAA archive bucket.
 
-    Downloads the mag-l3 dataset (GSM, 1-min averaged), resamples to the
+    Downloads the mag-l3 dataset (GSM, 1-min averaged) and the SWiPS L2
+    moments (from 2026-06-09, provisional maturity), resamples both to the
     standard 1-minute grid, and writes L1_solar1.dat to L1_raw/.
-    Plasma columns are filled with NaN (not yet available from SOLAR-1).
+
+    Only Ux, rho and T are kept from SWiPS; Uy/Uz are written as NaN. Checked
+    against WIND (hourly medians, 2026-06-09..19) the SWiPS Uz runs opposite
+    to WIND's (corr -0.89, slope -0.8) and Uy carries a ~+22 km/s offset,
+    while Ux (corr 0.99, ~3% slow) and rho (ratio ~1.0) agree. Revisit when
+    NOAA's reprocessed/"_corr" SWiPS products appear.
 
     Parameters
     ----------
     day : str  ('YYYY-MM-DD')
     data_dir : str  Scratch directory for temporary downloads.
     trange_start, trange_end : str  Day boundaries for the output grid.
-    cleanup : bool  Remove downloaded CSV after writing (default True).
+    cleanup : bool  Remove downloaded files after writing (default True).
     """
-    print('\nProcessing SOLAR-1 (HAPI)...')
+    print('\nProcessing SOLAR-1 (HAPI mag + SWiPS L2 plasma)...')
 
     csv_path = download_solar1_hapi(day, data_dir)
-
-    if csv_path is None:
-        print('  SOLAR-1 mag unavailable for this day.')
-        return
-
-    df_mag = hapi_csv_to_df(csv_path, _HAPI_MAG_COL_MAP)
-
-    if df_mag.empty:
-        print('  SOLAR-1: empty mag DataFrame, skipping.')
-        return
+    try:
+        swips_path = download_swips_l2(day, data_dir)
+    except RuntimeError as e:
+        print(f'  WARNING: SWiPS unavailable -- {e}')
+        swips_path = None
 
     grid = pd.date_range(start=trange_start, end=trange_end, freq='1min')
-    df_master = pd.DataFrame(index=grid)
+    df_final = pd.DataFrame(index=grid)
 
-    df_mag_res = df_mag.resample('1min').mean().interpolate(
-        method='time', limit=1)
-    df_final = df_master.join(df_mag_res)
-
-    for col in ('Ux', 'Uy', 'Uz', 'rho', 'T'):
-        df_final[col] = np.nan
-
-    missing = [c for c in ('Bx', 'By', 'Bz') if c not in df_final.columns]
-    if missing:
+    df_mag = (hapi_csv_to_df(csv_path, _HAPI_MAG_COL_MAP)
+              if csv_path is not None else pd.DataFrame())
+    if csv_path is None:
+        print('  SOLAR-1 mag unavailable for this day.')
+    elif df_mag.empty:
+        print('  SOLAR-1: empty mag DataFrame.')
+    missing = [c for c in ('Bx', 'By', 'Bz') if c not in df_mag.columns]
+    if not df_mag.empty and missing:
         print(f'  solar1: mag columns {missing} missing after parse '
-              '(unexpected HAPI CSV layout?), skipping.')
-    elif df_final[['Bx', 'By', 'Bz']].isna().all().all():
-        print('  solar1: all mag data is NaN for this day, skipping.')
+              '(unexpected HAPI CSV layout?), ignoring mag.')
+    if not df_mag.empty and not missing:
+        df_final = df_final.join(
+            df_mag[['Bx', 'By', 'Bz']].resample('1min').mean()
+            .interpolate(method='time', limit=1))
+    for col in ('Bx', 'By', 'Bz'):
+        if col not in df_final.columns:
+            df_final[col] = np.nan
+
+    df_plasma = (swips_l2_to_df(swips_path) if swips_path is not None
+                 else pd.DataFrame())
+    if not df_plasma.empty:
+        df_final = df_final.join(
+            df_plasma[['Ux', 'rho', 'T']].resample('1min').mean()
+            .interpolate(method='time', limit=1))
+    for col in ('Ux', 'Uy', 'Uz', 'rho', 'T'):
+        if col not in df_final.columns:
+            df_final[col] = np.nan
+
+    if df_final[['Bx', 'By', 'Bz', 'Ux', 'rho']].isna().all().all():
+        print('  solar1: all data is NaN for this day, skipping.')
     else:
         dt_start = datetime.strptime(trange_start, '%Y-%m-%d')
         raw_output_dir = os.path.join(raw_base, dt_start.strftime('%Y/%m/%d'))
@@ -365,18 +443,90 @@ def process_satellite_hapi(day, data_dir, trange_start, trange_end,
         _write_l1_dat(
             df_final,
             raw_output_file,
-            'Produced from SOLAR-1 NCEI HAPI mag-l3 (raw)',
+            'Produced from SOLAR-1 NCEI HAPI mag-l3 + SWiPS L2 (raw)',
         )
         print(f'Saved {raw_output_file}')
 
-    if cleanup and csv_path:
-        try:
-            os.remove(csv_path)
-        except Exception as e:
-            print(f'  Could not remove {csv_path}: {e}')
+    if cleanup:
+        for fpath in (csv_path, swips_path):
+            if fpath:
+                try:
+                    os.remove(fpath)
+                except Exception as e:
+                    print(f'  Could not remove {fpath}: {e}')
+
+
+def process_satellite_imap(day, data_dir, trange_start, trange_end,
+                           cleanup=True, raw_base='L1_raw'):
+    """Download-phase processing for IMAP from the IMAP Science Data Center.
+
+    MAG L2 normal-rate GSM (~2 Hz) is averaged to 1 minute. SWAPI L3a proton
+    moments (~1-min windows) give the full plasma set; the Sun-frame RTN
+    velocity (orbital motion already removed, the MIDL convention) is rotated
+    RTN -> GSE -> GSM. Checked against WIND (hourly medians,
+    2026-05-01..06-19): Ux corr 0.99 (~3% slow), Uy 0.87, Uz 0.81, rho 0.95,
+    B components 0.90-0.96. Writes L1_imap.dat to L1_raw/.
+
+    Parameters
+    ----------
+    day : str  ('YYYY-MM-DD')
+    data_dir : str  Scratch directory for temporary downloads.
+    trange_start, trange_end : str  Day boundaries for the output grid.
+    cleanup : bool  Remove downloaded CDFs after writing (default True).
+    """
+    print('\nProcessing IMAP (SDC MAG L2 + SWAPI L3a)...')
+
+    paths = download_imap_day(day, data_dir)
+
+    grid = pd.date_range(start=trange_start, end=trange_end, freq='1min')
+    df_final = pd.DataFrame(index=grid)
+
+    df_mag = (imap_mag_cdf_to_df(paths['mag']) if 'mag' in paths
+              else pd.DataFrame())
+    if not df_mag.empty:
+        df_final = df_final.join(
+            df_mag.resample('1min').mean().interpolate(method='time', limit=1))
+
+    df_sw = (imap_swapi_cdf_to_df(paths['swapi']) if 'swapi' in paths
+             else pd.DataFrame())
+    if not df_sw.empty:
+        v_gse = rtn_to_gse(df_sw.index, df_sw[['VR', 'VT', 'VN']].values)
+        df_sw = df_sw.assign(Ux=v_gse[:, 0], Uy=v_gse[:, 1], Uz=v_gse[:, 2])
+        df_plasma = (df_sw[['Ux', 'Uy', 'Uz', 'rho', 'T']]
+                     .resample('1min').mean().interpolate(method='time', limit=1))
+        gse_to_gsm(df_plasma, ['Ux', 'Uy', 'Uz'])
+        df_final = df_final.join(df_plasma)
+
+    for col in ('Bx', 'By', 'Bz', 'Ux', 'Uy', 'Uz', 'rho', 'T'):
+        if col not in df_final.columns:
+            df_final[col] = np.nan
+
+    if df_final[['Bx', 'By', 'Bz', 'Ux', 'rho']].isna().all().all():
+        print('  imap: all data is NaN for this day, skipping.')
+    else:
+        dt_start = datetime.strptime(trange_start, '%Y-%m-%d')
+        raw_output_dir = os.path.join(raw_base, dt_start.strftime('%Y/%m/%d'))
+        os.makedirs(raw_output_dir, exist_ok=True)
+        raw_output_file = os.path.join(raw_output_dir, 'L1_imap.dat')
+        _write_l1_dat(
+            df_final,
+            raw_output_file,
+            'Produced from IMAP SDC MAG L2 norm-gsm + SWAPI L3a proton-sw (raw)',
+        )
+        print(f'Saved {raw_output_file}')
+
+    if cleanup:
+        for fpath in paths.values():
+            try:
+                os.remove(fpath)
+            except Exception as e:
+                print(f'  Could not remove {fpath}: {e}')
 
 
 _SENTINEL_NAME = '.download_complete'
+
+# First day IMAP is fetched (MAG L2 begins here; IMAP was approaching L1).
+_IMAP_START = datetime(2026, 1, 1)
 
 
 def download_day(day, cda, raw_dir='L1_raw', data_dir='cdf_temp'):
@@ -414,6 +564,10 @@ def download_day(day, cda, raw_dir='L1_raw', data_dir='cdf_temp'):
     need_wind = not os.path.exists(os.path.join(day_raw_dir, 'L1_wind.dat'))
     need_dscovr = not os.path.exists(os.path.join(day_raw_dir, 'L1_dscovr.dat'))
     need_solar1 = not os.path.exists(os.path.join(day_raw_dir, 'L1_solar1.dat'))
+    # IMAP's archival data starts 2026-01-01 (MAG L2; SWAPI from 2025-11-08 in
+    # cruise); skip the SDC queries for earlier days.
+    need_imap = (dt >= _IMAP_START and not os.path.exists(
+        os.path.join(day_raw_dir, 'L1_imap.dat')))
 
     # Download CDAWeb datasets for ACE + WIND in a single API call.
     if need_ace or need_wind:
@@ -473,6 +627,9 @@ def download_day(day, cda, raw_dir='L1_raw', data_dir='cdf_temp'):
                  raw_base=raw_dir)
     if need_solar1:
         _guarded('solar1', process_satellite_hapi, day, data_dir,
+                 trange_start, trange_end, raw_base=raw_dir)
+    if need_imap:
+        _guarded('imap', process_satellite_imap, day, data_dir,
                  trange_start, trange_end, raw_base=raw_dir)
 
     # Position file (always recreate -- cheap and needed by combine step).
@@ -571,6 +728,15 @@ def create_position_file(day, cda, cleanup_cdfs=True, pos_dir='L1_raw',
             df_sol[['Sx', 'Sy', 'Sz']] /= 6371.0
             sol_mean = df_sol[['Sx', 'Sy', 'Sz']].mean()
 
+    # IMAP position from SSCWeb (GSM in km).
+    imap_mean = pd.Series({'Ix': np.nan, 'Iy': np.nan, 'Iz': np.nan})
+    if dt_start >= _IMAP_START:
+        xyz = sscweb_position_gsm('imap', dt_start.replace(hour=11),
+                                  dt_start.replace(hour=13))
+        if xyz is not None:
+            imap_mean = pd.Series(dict(zip(('Ix', 'Iy', 'Iz'),
+                                           (v / 6371.0 for v in xyz))))
+
     # Write one merged row for downstream propagation logic.
     with open(output_filepath, 'w', encoding='utf-8') as f:
         f.write(
@@ -589,7 +755,7 @@ def create_position_file(day, cda, cleanup_cdfs=True, pos_dir='L1_raw',
             f"{fmt(dsc_mean['Dx'])} {fmt(dsc_mean['Dy'])} {fmt(dsc_mean['Dz'])} "
             f"{fmt(wind_mean['Wx'])} {fmt(wind_mean['Wy'])} {fmt(wind_mean['Wz'])} "
             f"{fmt(sol_mean['Sx'])} {fmt(sol_mean['Sy'])} {fmt(sol_mean['Sz'])} "
-            f"{fmt(np.nan)} {fmt(np.nan)} {fmt(np.nan)}\n"
+            f"{fmt(imap_mean['Ix'])} {fmt(imap_mean['Iy'])} {fmt(imap_mean['Iz'])}\n"
         )
         f.write(line)
 

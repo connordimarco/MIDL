@@ -77,6 +77,15 @@ class TestReadSatPositions:
         for sat in pos:
             assert np.isnan(pos[sat])
 
+    def test_imap_position(self, tmp_path):
+        path = tmp_path / "L1_satpos.dat"
+        self._write_satpos(str(path),
+            "2026  7 15 12  0  0      nan      nan      nan      nan      nan      nan    240.1     -60.2     12.0    230.4     11.0     -3.0    227.4     35.9     -1.6")
+        pos, gated = _read_sat_positions(str(path))
+        assert abs(pos["imap"] / 6371.0 - 227.4) < 0.1
+        assert abs(pos["solar1"] / 6371.0 - 230.4) < 0.1
+        assert len(gated) == 0
+
     def test_nan_position(self, tmp_path):
         path = tmp_path / "L1_satpos.dat"
         self._write_satpos(str(path),

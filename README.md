@@ -1,6 +1,6 @@
 # Merged Interplanetary Data from L1 (MIDL)
 
-Downloads, quality-screens, and combines 1-minute solar wind from **ACE**, **DSCOVR**, **WIND**, and **SOLAR-1** into merged time series.
+Downloads, quality-screens, and combines 1-minute solar wind from **ACE**, **DSCOVR**, **WIND**, **SOLAR-1**, and **IMAP** into merged time series.
 
 ---
 
@@ -13,9 +13,10 @@ flowchart TD
         ACE["ACE (CDAWeb)"]
         DSC["DSCOVR (NOAA NGDC)"]
         WND["WIND (CDAWeb)"]
-        SOL["SOLAR-1 (NCEI HAPI)"]
-        SP["&nbsp;&nbsp;&nbsp;&nbsp;Download · parse · resample to 1-min&nbsp;&nbsp;&nbsp;&nbsp;<br/>GSE→GSM · despike"]
-        ACE & DSC & WND & SOL --> SP
+        SOL["SOLAR-1 (NCEI HAPI + NOAA archive)"]
+        IMP["IMAP (IMAP SDC)"]
+        SP["&nbsp;&nbsp;&nbsp;&nbsp;Download · parse · resample to 1-min&nbsp;&nbsp;&nbsp;&nbsp;<br/>RTN/GSE→GSM · despike"]
+        ACE & DSC & WND & SOL & IMP --> SP
     end
 
     L1R[/"L1_raw / YYYY/MM/DD /<br/>per-satellite .dat"/]
@@ -74,7 +75,7 @@ Details of each stage live in the File Inventory and Methodology sections below.
 
 | File | Description |
 |---|---|
-| `YYYYMM_L1.csv` | Merged stream at reference satellite position. Includes `X_Re` and source provenance columns (`B_source`, `Ux_source`, `Uyz_source`, `rho_source`, `T_source`). Source values are satellite codes: 1=ACE, 2=DSCOVR, 3=WIND, 4=SOLAR-1, concatenated (e.g. `13` = ACE+WIND, `34` = WIND+SOLAR-1). |
+| `YYYYMM_L1.csv` | Merged stream at reference satellite position. Includes `X_Re` and source provenance columns (`B_source`, `Ux_source`, `Uyz_source`, `rho_source`, `T_source`). Source values are satellite codes: 1=ACE, 2=DSCOVR, 3=WIND, 4=SOLAR-1, 5=IMAP, concatenated (e.g. `13` = ACE+WIND, `34` = WIND+SOLAR-1). |
 | `YYYYMM_14Re.csv` | Combined stream ballistically propagated to 14 Re |
 | `YYYYMM_32Re.csv` | Combined stream ballistically propagated to 32 Re |
 | `mhd/YYYYMM_mhd_<RRR>Re.csv` | 1D BATSRUS MHD solution at a single X slice, one file per integer Re from -70 to +70 (141 files per month). `<RRR>` is a 3-character zero-padded integer — e.g. `000Re`, `032Re`, `-70Re`. |
@@ -88,11 +89,14 @@ Details of each stage live in the File Inventory and Methodology sections below.
 | ACE | `AC_H0_MFI` (GSM) | `AC_H0_SWE` (GSM) | CDAWeb |
 | DSCOVR | NGDC `m1m` (GSM) | NGDC `f1m` (GSM) | NOAA NGDC |
 | WIND | `WI_H0_MFI` (GSM) | `WI_H1_SWE` (GSE → GSM) | CDAWeb |
-| SOLAR-1 | `mag-l3_solar1` (GSM) | — (not yet available) | NOAA NCEI HAPI |
+| SOLAR-1 | `mag-l3_solar1` (GSM) | SWiPS L2 (GSM; Ux, rho, T only) | NOAA NCEI HAPI (mag), NOAA archive bucket (plasma) |
+| IMAP | MAG L2 `norm-gsm` (GSM) | SWAPI L3a `proton-sw` (RTN → GSE → GSM) | IMAP Science Data Center |
 
 DSCOVR plasma is taken from NOAA NGDC because the CDAWeb Faraday cup plasma product ends around 2019.
 
-SOLAR-1 (SWFO-L1) magnetometer data is available from 2026-04-01 onward. Plasma instruments have not yet published data; plasma columns are NaN placeholders.
+SOLAR-1 (SWFO-L1) magnetometer data is available from 2026-04-01 onward, SWiPS plasma from 2026-06-09 (provisional maturity). Only Ux, rho and T are used from SWiPS: checked against WIND, its Uz runs opposite to WIND's and its Uy carries a ~+22 km/s offset, so Uy/Uz are left NaN.
+
+IMAP data is used from 2026-01-01 (both products lag real time by about two months). SWAPI's Sun-frame velocity already has orbital motion removed, matching the other sources. IMAP's position comes from SSCWeb.
 
 > **Note:** GSE→GSM coordinate rotation uses spacepy's IGRF geomagnetic field model, which has a finite validity window (currently through 2030 with IGRF14). Processing certain dates requires updating spacepy to a version with newer IGRF coefficients.
 

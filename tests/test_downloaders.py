@@ -85,7 +85,7 @@ class TestDscovrAvailableDays:
             f'{prefix}oe_m1m_dscovr_s20260603000000_e20260603235959'
             '_p20260604021954_pub.nc.gz',
         ]
-        monkeypatch.setitem(dl._dscovr_listing_cache, prefix, keys)
+        monkeypatch.setitem(dl._archive_listing_cache, prefix, keys)
         days = dl.dscovr_available_days('f1m', ['2026-06'])
         assert days == {'2026-06-01', '2026-06-02'}
 
@@ -93,7 +93,7 @@ class TestDscovrAvailableDays:
         def boom(prefix):
             raise RuntimeError('listing failed')
         monkeypatch.setattr(dl, 'noaa_archive_list', boom)
-        dl._dscovr_listing_cache.pop(
+        dl._archive_listing_cache.pop(
             f"{dl._DSCOVR_PRODUCT_PREFIX['m1m']}/2031/01/", None)
         assert dl.dscovr_available_days('m1m', ['2031-01']) is None
 
@@ -117,3 +117,114 @@ class TestHapiCoverage:
             raise OSError('network down')
         monkeypatch.setattr(dl.requests, 'get', boom)
         assert dl.hapi_coverage('mag-l3_solar1') is None
+
+
+# ---------------------------------------------------------------------------
+# SOLAR-1 SWiPS L2 (NOAA archive bucket, via the listing cache)
+# ---------------------------------------------------------------------------
+
+def _swips_key(day, produced):
+    return (f'{dl._SWIPS_L2_PREFIX}/{day[:4]}/{day[4:6]}/'
+            f'oe_swips-l2_solar1_s{day}T000000Z_e{day}T235959Z'
+            f'_p{produced}Z_pub.nc.gz')
+
+
+class TestSwips:
+    def test_available_days(self, monkeypatch):
+        prefix = f'{dl._SWIPS_L2_PREFIX}/2026/09/'
+        keys = [_swips_key('20260901', '20260915T032107'),
+                _swips_key('20260902', '20260915T031335'),
+                prefix + 'unrelated.txt']
+        monkeypatch.setitem(dl._archive_listing_cache, prefix, keys)
+        assert dl.swips_available_days(['2026-09']) == {'2026-09-01',
+                                                         '2026-09-02'}
+
+    def test_listing_error_returns_none(self, monkeypatch):
+        def boom(prefix):
+            raise RuntimeError('listing failed')
+        monkeypatch.setattr(dl, 'noaa_archive_list', boom)
+        dl._archive_listing_cache.pop(f'{dl._SWIPS_L2_PREFIX}/2031/01/', None)
+        assert dl.swips_available_days(['2031-01']) is None
+
+    def test_download_picks_newest_reprocessing(self, monkeypatch, tmp_path):
+        prefix = f'{dl._SWIPS_L2_PREFIX}/2026/09/'
+        old = _swips_key('20260901', '20260915T032107')
+        new = _swips_key('20260901', '20261020T010000')
+        monkeypatch.setitem(dl._archive_listing_cache, prefix, [new, old])
+        fetched = []
+        monkeypatch.setattr(dl, '_download_url',
+                            lambda url, path, timeout=300: fetched.append(url))
+        path = dl.download_swips_l2('2026-09-01', str(tmp_path))
+        assert fetched == [f'{dl._NOAA_ARCHIVE_BASE}/{new}']
+        assert path.endswith('solar1_swips_20260901.nc.gz')
+
+    def test_download_missing_day_returns_none(self, monkeypatch, tmp_path):
+        prefix = f'{dl._SWIPS_L2_PREFIX}/2026/09/'
+        monkeypatch.setitem(dl._archive_listing_cache, prefix,
+                            [_swips_key('20260901', '20260915T032107')])
+        assert dl.download_swips_l2('2026-09-02', str(tmp_path)) is None
+
+
+# ---------------------------------------------------------------------------
+# IMAP SDC helpers
+# ---------------------------------------------------------------------------
+
+class TestImapSdc:
+    _RECORDS = [
+        {'start_date': '20260715', 'version': 'v001.0001',
+         'file_path': 'imap/mag/l2/2026/07/a_20260715_v001.0001.cdf'},
+        {'start_date': '20260715', 'version': 'v001.0002',
+         'file_path': 'imap/mag/l2/2026/07/a_20260715_v001.0002.cdf'},
+        {'start_date': '20260716', 'version': 'v001.0001',
+         'file_path': 'imap/mag/l2/2026/07/a_20260716_v001.0001.cdf'},
+    ]
+
+    def test_latest_version_per_day(self):
+        files = dl._latest_imap_files(self._RECORDS)
+        assert files == {
+            '20260715': 'imap/mag/l2/2026/07/a_20260715_v001.0002.cdf',
+            '20260716': 'imap/mag/l2/2026/07/a_20260716_v001.0001.cdf',
+        }
+
+    def test_available_days(self, monkeypatch):
+        monkeypatch.setattr(dl, '_imap_query', lambda *a, **k: self._RECORDS)
+        assert dl.imap_available_days('mag', '2026-07-01', '2026-07-31') == {
+            '2026-07-15', '2026-07-16'}
+
+    def test_query_error_returns_none(self, monkeypatch):
+        def boom(*a, **k):
+            raise OSError('network down')
+        monkeypatch.setattr(dl, '_imap_query', boom)
+        assert dl.imap_available_days('swapi', '2026-07-01', '2026-07-31') is None
+
+
+# ---------------------------------------------------------------------------
+# sscweb_position_gsm
+# ---------------------------------------------------------------------------
+
+class TestSscwebPosition:
+    def test_mean_position(self, monkeypatch):
+        from datetime import datetime
+        payload = ['Response', {'Result': ['DataResult', {'Data': ['list', [
+            ['SatelliteData', {'Coordinates': ['list', [['CoordinateData', {
+                'X': ['list', [1.4e6, 1.6e6]],
+                'Y': ['list', [1.0e5, 3.0e5]],
+                'Z': ['list', [-2.0e4, 0.0]],
+            }]]]}]]]}]}]
+
+        class _JsonResponse(_FakeResponse):
+            def json(self):
+                return payload
+        monkeypatch.setattr(dl.requests, 'get',
+                            lambda url, headers, timeout: _JsonResponse(''))
+        xyz = dl.sscweb_position_gsm('imap', datetime(2026, 7, 15, 11),
+                                     datetime(2026, 7, 15, 13))
+        assert xyz == pytest.approx((1.5e6, 2.0e5, -1.0e4))
+
+    def test_error_returns_none(self, monkeypatch):
+        from datetime import datetime
+        def boom(url, headers, timeout):
+            raise OSError('network down')
+        monkeypatch.setattr(dl.requests, 'get', boom)
+        assert dl.sscweb_position_gsm('imap', datetime(2026, 7, 15, 11),
+                                      datetime(2026, 7, 15, 13)) is None

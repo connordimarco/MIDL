@@ -36,8 +36,7 @@ _INTERP_VARS = _NUMERIC_COLS  # one flag column per numeric variable
 # cadence.
 _PLASMA_INTERP_VARS = {'Ux', 'Uy', 'Uz', 'rho', 'T'}
 
-SATELLITES = ('ace', 'dscovr', 'wind', 'solar1')
-# When IMAP data becomes available, add 'imap' here.
+SATELLITES = ('ace', 'dscovr', 'wind', 'solar1', 'imap')
 
 
 @dataclass
@@ -58,8 +57,8 @@ class MIDLResult:
         calendar day.  The reference satellite is the one closest to Earth.
     source_map : dict[str, pd.Series]
         Per-variable source provenance. Each Series contains frozenset of
-        satellite codes (1=ACE, 2=DSCOVR, 3=WIND, 4=SOLAR-1) at each
-        minute.  Code 5 reserved for IMAP.
+        satellite codes (1=ACE, 2=DSCOVR, 3=WIND, 4=SOLAR-1, 5=IMAP) at
+        each minute.
         Keys: Bx, By, Bz, Ux, Uy, Uz, rho, T.
     mhd_profile : xr.Dataset or None
         1D MHD-propagated solar wind profile produced by BATSRUS when
@@ -138,7 +137,7 @@ def _read_sat_positions(pos_file):
     in the magnetotail pre-2004, DSCOVR in transit Feb 2015) and their
     position is set to NaN so they are excluded from propagation.
     """
-    result = {'ace': np.nan, 'dscovr': np.nan, 'wind': np.nan, 'solar1': np.nan}
+    result = {sat: np.nan for sat in SATELLITES}
     if not os.path.exists(pos_file):
         return result, set()
     try:
@@ -157,6 +156,8 @@ def _read_sat_positions(pos_file):
                     result['wind']   = float(parts[12]) * 6371.0
                     if len(parts) >= 18:
                         result['solar1'] = float(parts[15]) * 6371.0
+                    if len(parts) >= 21:
+                        result['imap'] = float(parts[18]) * 6371.0
                     break
     except Exception as e:
         print(f'  Warning: Could not read position file ({e}).')

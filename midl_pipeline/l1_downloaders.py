@@ -3,16 +3,20 @@ l1_downloaders.py
 -----------------
 Download helpers for raw L1 data files.
 
-Three sources are supported:
+Five sources are supported:
   - CDAWeb  (ACE, WIND, DSCOVR orbit) via the pyspedas CDAWeb client.
-  - NOAA archive S3 bucket (DSCOVR 1-min plasma + mag) via direct HTTP
-    requests. (Until ~2026-02 this lived at www.ngdc.noaa.gov/dscovr/data/,
-    which now redirects to a JS bucket explorer.)
+  - NOAA archive S3 bucket (DSCOVR 1-min plasma + mag, SOLAR-1 SWiPS L2
+    plasma) via direct HTTP requests. (Until ~2026-02 DSCOVR lived at
+    www.ngdc.noaa.gov/dscovr/data/, which now redirects to a JS bucket
+    explorer.)
   - NOAA NCEI HAPI (SOLAR-1 mag + orbit) via REST CSV downloads.
+  - IMAP Science Data Center API (IMAP MAG L2 + SWAPI L3a) via REST.
+  - SSCWeb REST API (IMAP orbit).
 
 Also provides the upstream-availability helpers (cdaweb_available_days,
-dscovr_available_days, hapi_coverage) used by the gapfill script to skip
-day-fetches for data that does not exist upstream.
+dscovr_available_days, swips_available_days, hapi_coverage,
+imap_available_days) used by the gapfill script to skip day-fetches for data
+that does not exist upstream.
 
 Files are written to local scratch directories inside cdf_temp/ and are
 expected to be cleaned up by the calling pipeline after processing.
@@ -40,9 +44,21 @@ _DSCOVR_PRODUCT_PREFIX = {
     'f1m': 'DSCOVR/DSCOVR/FC/f1m',
     'm1m': 'DSCOVR/DSCOVR/MAG/m1m',
 }
+# SOLAR-1 SWiPS L2 (1-min plasma moments) in the same bucket. L3 also exists
+# but has held 1-row all-zero placeholder files since mid-July 2026.
+_SWIPS_L2_PREFIX = 'SWFO/SOLAR-1/SWIPS/swips-l2'
 # Month-listing cache: {S3 prefix -> list of keys}. Per-process, so repeated
 # same-month day downloads cost one listing request instead of one per day.
-_dscovr_listing_cache = {}
+_archive_listing_cache = {}
+
+# IMAP Science Data Center. Products are (instrument, data_level, descriptor).
+_IMAP_API_BASE = 'https://api.imap-mission.com'
+IMAP_PRODUCTS = {
+    'mag':   ('mag', 'l2', 'norm-gsm'),
+    'swapi': ('swapi', 'l3a', 'proton-sw'),
+}
+
+_SSCWEB_BASE = 'https://sscweb.gsfc.nasa.gov/WS/sscr/2'
 
 
 def _parse_s3_keys(xml_text):
@@ -121,17 +137,88 @@ def dscovr_available_days(product, months):
         y, m = month.split('-')
         prefix = f'{_DSCOVR_PRODUCT_PREFIX[product]}/{y}/{m}/'
         try:
-            if prefix not in _dscovr_listing_cache:
-                _dscovr_listing_cache[prefix] = noaa_archive_list(prefix)
+            if prefix not in _archive_listing_cache:
+                _archive_listing_cache[prefix] = noaa_archive_list(prefix)
         except RuntimeError as e:
             print(f'  WARNING: {e}')
             return None
-        for key in _dscovr_listing_cache[prefix]:
+        for key in _archive_listing_cache[prefix]:
             match = pattern.search(key)
             if match:
                 d = match.group(1)
                 days.add(f'{d[:4]}-{d[4:6]}-{d[6:]}')
     return days
+
+
+_SWIPS_L2_RE = re.compile(
+    r'oe_swips-l2_solar1_s(\d{8})T\d{6}Z_e\d{8}T\d{6}Z_p(\d{8}T\d{6})Z_pub\.nc\.gz$')
+
+
+def _swips_month_keys(year, month):
+    """SWiPS L2 keys for one month (cached listing). Raises RuntimeError."""
+    prefix = f'{_SWIPS_L2_PREFIX}/{year}/{month:02d}/'
+    if prefix not in _archive_listing_cache:
+        _archive_listing_cache[prefix] = noaa_archive_list(prefix)
+    return _archive_listing_cache[prefix]
+
+
+def swips_available_days(months):
+    """Days ('YYYY-MM-DD') with a SOLAR-1 SWiPS L2 file upstream.
+
+    One bucket listing per month in `months` (iterable of 'YYYY-MM').
+    Returns None on any fetch error (caller fails open).
+    """
+    days = set()
+    for month in months:
+        y, m = month.split('-')
+        try:
+            keys = _swips_month_keys(int(y), int(m))
+        except RuntimeError as e:
+            print(f'  WARNING: {e}')
+            return None
+        for key in keys:
+            match = _SWIPS_L2_RE.search(key)
+            if match:
+                d = match.group(1)
+                days.add(f'{d[:4]}-{d[4:6]}-{d[6:]}')
+    return days
+
+
+def _imap_query(product, start_date, end_date, timeout=120):
+    """IMAP SDC file records for `product` ('mag'|'swapi') between two
+    'YYYYMMDD' dates (inclusive). Raises on HTTP/JSON errors."""
+    instrument, level, descriptor = IMAP_PRODUCTS[product]
+    resp = requests.get(f'{_IMAP_API_BASE}/query', params={
+        'instrument': instrument, 'data_level': level,
+        'descriptor': descriptor,
+        'start_date': start_date, 'end_date': end_date,
+    }, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _latest_imap_files(records):
+    """{'YYYYMMDD' -> file_path} keeping the highest version for each day."""
+    best = {}
+    for rec in records:
+        day = rec['start_date']
+        if day not in best or rec['version'] > best[day]['version']:
+            best[day] = rec
+    return {day: rec['file_path'] for day, rec in best.items()}
+
+
+def imap_available_days(product, start_day, end_day):
+    """Days ('YYYY-MM-DD') with an IMAP `product` file at the SDC, between
+    two 'YYYY-MM-DD' days inclusive. One query for the whole range.
+    Returns None on any fetch error (caller fails open).
+    """
+    try:
+        records = _imap_query(product, start_day.replace('-', ''),
+                              end_day.replace('-', ''))
+    except Exception as e:
+        print(f'  WARNING: IMAP SDC query for {product} failed: {e}')
+        return None
+    return {f'{d[:4]}-{d[4:6]}-{d[6:]}' for d in _latest_imap_files(records)}
 
 
 def hapi_coverage(dataset, timeout=60):
@@ -281,14 +368,14 @@ def download_dscovr_ngdc(day, data_dir, products=('f1m', 'm1m')):
     paths = {}
     for product in products:
         prefix = f'{_DSCOVR_PRODUCT_PREFIX[product]}/{dt.year}/{dt.month:02d}/'
-        if prefix not in _dscovr_listing_cache:
-            _dscovr_listing_cache[prefix] = noaa_archive_list(prefix)
+        if prefix not in _archive_listing_cache:
+            _archive_listing_cache[prefix] = noaa_archive_list(prefix)
 
         # Filenames include run-specific tags, so we match by regex.
         pattern = re.compile(
             rf'oe_{re.escape(product)}_dscovr_s{date_str}\d+'
             rf'_e{date_str}\d+_p\d+_pub\.nc\.gz$')
-        key = next((k for k in _dscovr_listing_cache[prefix]
+        key = next((k for k in _archive_listing_cache[prefix]
                     if pattern.search(k)), None)
         if key is None:
             print(f"  WARNING: No NGDC {product} file found for {day}.")
@@ -311,6 +398,108 @@ def download_dscovr_ngdc(day, data_dir, products=('f1m', 'm1m')):
             print(f"  WARNING: Failed to download {file_url}: {e}")
 
     return paths
+
+
+def _download_url(url, local_path, timeout=300):
+    """Stream `url` to `local_path`. Raises on failure."""
+    r = requests.get(url, timeout=timeout, stream=True)
+    r.raise_for_status()
+    with open(local_path, 'wb') as f:
+        for chunk in r.iter_content(chunk_size=1 << 16):
+            f.write(chunk)
+
+
+def download_swips_l2(day, data_dir):
+    """Download the SOLAR-1 SWiPS L2 file for one day from the NOAA archive.
+
+    When a day has been reprocessed, the newest production time (_p tag)
+    wins. Returns the local .nc.gz path, or None if there is no file.
+
+    Raises
+    ------
+    RuntimeError
+        If the month listing cannot be fetched.
+    """
+    dt = datetime.strptime(day, '%Y-%m-%d')
+    date_str = dt.strftime('%Y%m%d')
+    os.makedirs(data_dir, exist_ok=True)
+
+    matches = []
+    for key in _swips_month_keys(dt.year, dt.month):
+        m = _SWIPS_L2_RE.search(key)
+        if m and m.group(1) == date_str:
+            matches.append((m.group(2), key))
+    if not matches:
+        print(f'  WARNING: No SWiPS L2 file found for {day}.')
+        return None
+    key = max(matches)[1]
+
+    local_path = os.path.join(data_dir, f'solar1_swips_{date_str}.nc.gz')
+    try:
+        _download_url(f'{_NOAA_ARCHIVE_BASE}/{key}', local_path, timeout=120)
+    except Exception as e:
+        print(f'  WARNING: Failed to download {key}: {e}')
+        return None
+    print(f'  Downloaded {os.path.basename(key)} -> {local_path}')
+    return local_path
+
+
+def download_imap_day(day, data_dir, products=('mag', 'swapi')):
+    """Download IMAP MAG L2 (GSM, normal rate) and SWAPI L3a proton files for
+    one day from the IMAP Science Data Center.
+
+    Returns
+    -------
+    paths : dict[str, str]
+        Maps product ('mag'|'swapi') -> local CDF path for each file found.
+    """
+    date_str = day.replace('-', '')
+    os.makedirs(data_dir, exist_ok=True)
+    paths = {}
+    for product in products:
+        try:
+            files = _latest_imap_files(_imap_query(product, date_str, date_str))
+        except Exception as e:
+            print(f'  WARNING: IMAP SDC query for {product} {day} failed: {e}')
+            continue
+        file_path = files.get(date_str)
+        if file_path is None:
+            print(f'  WARNING: No IMAP {product} file found for {day}.')
+            continue
+        local_path = os.path.join(data_dir, os.path.basename(file_path))
+        try:
+            _download_url(f'{_IMAP_API_BASE}/download/{file_path}', local_path)
+        except Exception as e:
+            print(f'  WARNING: Failed to download IMAP {file_path}: {e}')
+            continue
+        paths[product] = local_path
+        print(f'  Downloaded {os.path.basename(file_path)} -> {local_path}')
+    return paths
+
+
+def sscweb_position_gsm(observatory, start, stop, timeout=60):
+    """Mean GSM position (x, y, z) in km over [start, stop] from SSCWeb.
+
+    `start`/`stop` are datetimes (UTC). Returns None if SSCWeb has no data
+    or the request fails.
+    """
+    fmt = '%Y%m%dT%H%M%SZ'
+    url = (f'{_SSCWEB_BASE}/locations/{observatory}/'
+           f'{start.strftime(fmt)},{stop.strftime(fmt)}/gsm/')
+    try:
+        resp = requests.get(url, headers={'Accept': 'application/json'},
+                            timeout=timeout)
+        resp.raise_for_status()
+        # SSCWeb JSON wraps every object as [java_class_name, payload].
+        result = resp.json()[1]['Result'][1]
+        coords = result['Data'][1][0][1]['Coordinates'][1][0][1]
+        xyz = [coords[axis][1] for axis in ('X', 'Y', 'Z')]
+    except Exception as e:
+        print(f'  WARNING: SSCWeb position for {observatory} failed: {e}')
+        return None
+    if not xyz[0]:
+        return None
+    return tuple(sum(v) / len(v) for v in xyz)
 
 
 def _download_hapi_csv(dataset, parameters, start, stop, data_dir, local_name,

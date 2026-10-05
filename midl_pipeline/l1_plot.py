@@ -28,6 +28,7 @@ SAT_COLORS = {
     'dscovr': ('#ff7f0e', 'DSCOVR'),
     'wind': ('#2ca02c', 'WIND'),
     'solar1': ('#9467bd', 'SOLAR-1'),
+    'imap': ('#8c564b', 'IMAP'),
 }
 
 VAR_LABELS = {
